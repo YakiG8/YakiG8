@@ -1,5 +1,5 @@
 - 👋 Hi there! I'm Yaki Clarita Guerrero García.
-- 👀 I am passionate about industrial engineering and currently expanding my knowledge in programming for data analysis and process automation.ation.
+- 👀 I'm passionate about industrial engineering and currently expanding my knowledge in programming for data analysis and process automation.ation.
 - 🌱 Right now, I'm diving into SQL for data management and Python for scripting and data analysis.
 - 💞️ I'm looking to collaborate on projects that integrate industrial engineering with programming solutions.
 - 📫 You can reach me via email at yakiclaritag@gmail.com.
