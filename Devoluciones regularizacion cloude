@@ -1,0 +1,908 @@
+import { useState, useEffect, useRef } from "react";
+import * as XLSX from 'xlsx';
+
+const CORP_DOMAINS = ['sodimac.com','falabella.com','sodimac.cl','falabella.cl','sodimac.pe','falabella.pe'];
+const isCorp = email => CORP_DOMAINS.some(d => email.toLowerCase().endsWith('@'+d));
+const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+const fmtD = s => { if(!s)return'—';const[y,m,d]=s.split('-');return d+'/'+m+'/'+y; };
+const fmtSz = b => b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB';
+const fIcon = n => ({pdf:'📄',jpg:'🖼️',jpeg:'🖼️',png:'🖼️',xlsx:'📊',xls:'📊',doc:'📝',docx:'📝'})[n.split('.').pop().toLowerCase()]||'📎';
+const toB64 = f => new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(f);});
+
+const db = {
+  get: async k=>{try{const r=await window.storage.get(k,true);return r?JSON.parse(r.value):null;}catch{return null;}},
+  set: async(k,v)=>{try{await window.storage.set(k,JSON.stringify(v),true);}catch{}},
+  del: async k=>{try{await window.storage.delete(k,true);}catch{}}
+};
+const K = {T:'sod_t5',P:'sod_p5',R:'sod_r5',USERS:'sod_u5',CONT:'sod_c5',PEND:'sod_pnd5',F:(id,i)=>'sod_f5_'+id+'_'+i};
+const DT=['Tienda Centro','Tienda Norte','Tienda Sur','Tienda Este','Tienda Oeste'];
+const DP=['Proveedor General S.A.','Distribuidora ABC S.A.C.','Importaciones XYZ'];
+
+const OG='#F47B20',BL='#1e3a5f',BL2='#2563eb';
+const cardS={background:'white',borderRadius:12,boxShadow:'0 1px 8px rgba(0,0,0,0.09)',overflow:'hidden'};
+const hdS={background:'linear-gradient(135deg,'+BL+','+BL2+')',padding:'15px 22px',color:'white'};
+const lblS={fontSize:12,fontWeight:700,color:'#374151',marginBottom:3,display:'block'};
+const inpS=err=>({width:'100%',padding:'9px 11px',border:'1.5px solid '+(err?'#ef4444':'#d1d5db'),borderRadius:6,fontSize:13,outline:'none',boxSizing:'border-box',background:'white',color:'#111',fontFamily:'inherit'});
+
+// ── Field at module level (fixes cursor jump) ──────────────────────────────
+function Field({label,req,error,children}){
+  return(
+    <div>
+      <label style={lblS}>{label}{req?<span style={{color:'#ef4444'}}> *</span>:<span style={{color:'#9ca3af',fontWeight:400}}> (opcional)</span>}</label>
+      {children}
+      {error&&<span style={{color:'#ef4444',fontSize:11,display:'block',marginTop:2}}>⚠ {error}</span>}
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────
+export default function App(){
+  const [user,setUser]=useState(null);
+  const [tab,setTab]=useState('nuevo');
+  const [tiendas,setTiendas]=useState([]);
+  const [provs,setProvs]=useState([]);
+  const [records,setRecords]=useState([]);
+  const [users,setUsers]=useState([]);
+  const [contacts,setContacts]=useState([]);
+  const [pending,setPending]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [toast,setToast]=useState(null);
+
+  useEffect(()=>{init();},[]);
+  const init=async()=>{
+    setLoading(true);
+    const t=await db.get(K.T);setTiendas(t||DT);
+    const p=await db.get(K.P);setProvs(p||DP);
+    const r=await db.get(K.R);setRecords(r||[]);
+    const u=await db.get(K.USERS);setUsers(u||[]);
+    const c=await db.get(K.CONT);setContacts(c||[]);
+    const pnd=await db.get(K.PEND);setPending(pnd||[]);
+    setLoading(false);
+  };
+
+  const notify=(msg,type='ok')=>{setToast({msg,type});setTimeout(()=>setToast(null),3500);};
+
+  const login=async(email,pw)=>{
+    const us=await db.get(K.USERS)||[];
+    const u=us.find(x=>x.email.toLowerCase()===email.toLowerCase()&&x.password===pw);
+    if(!u)return'Correo o contraseña incorrectos';
+    if(!u.approved)return'Cuenta pendiente de aprobación';
+    setUser(u);return null;
+  };
+
+  const register=async(name,email,pw)=>{
+    const us=await db.get(K.USERS)||[];
+    if(us.find(x=>x.email.toLowerCase()===email.toLowerCase()))return'Correo ya registrado';
+    if(!isCorp(email))return'NOT_CORP';
+    const nu={id:uid(),name,email,password:pw,approved:true,role:us.length===0?'admin':'user',createdAt:new Date().toISOString()};
+    const nl=[...us,nu];await db.set(K.USERS,nl);setUsers(nl);setUser(nu);return null;
+  };
+
+  const requestAccess=async(name,email,reason)=>{
+    const pnd=await db.get(K.PEND)||[];
+    if(pnd.find(x=>x.email.toLowerCase()===email.toLowerCase()))return'Ya existe una solicitud con este correo';
+    const nl=[...pnd,{id:uid(),name,email,reason,requestedAt:new Date().toISOString()}];
+    await db.set(K.PEND,nl);setPending(nl);return null;
+  };
+
+  const approveUser=async(pid,pw)=>{
+    const pnd=await db.get(K.PEND)||[];
+    const req=pnd.find(x=>x.id===pid);if(!req)return;
+    const us=await db.get(K.USERS)||[];
+    const nu={id:uid(),name:req.name,email:req.email,password:pw||'Sodimac2025',approved:true,role:'user',createdAt:new Date().toISOString()};
+    const nl=[...us,nu],np=pnd.filter(x=>x.id!==pid);
+    await db.set(K.USERS,nl);await db.set(K.PEND,np);setUsers(nl);setPending(np);
+    notify('Usuario aprobado. Contraseña: '+(pw||'Sodimac2025'));
+  };
+
+  const rejectUser=async pid=>{
+    const pnd=await db.get(K.PEND)||[];
+    const np=pnd.filter(x=>x.id!==pid);await db.set(K.PEND,np);setPending(np);notify('Solicitud rechazada');
+  };
+
+  const addRecord=async(rec,files)=>{
+    const archivos=[];
+    for(let i=0;i<files.length;i++){
+      const f=files[i],key=K.F(rec.id,i);
+      try{const data=await toB64(f);await db.set(key,{name:f.name,type:f.type,size:f.size,data});archivos.push({name:f.name,type:f.type,size:f.size,key});}
+      catch{archivos.push({name:f.name,type:f.type,size:f.size,key,err:true});}
+    }
+    const full={...rec,archivos,uploadedBy:user.name,uploadedEmail:user.email};
+    const list=[...records,full];setRecords(list);await db.set(K.R,list);
+  };
+
+  const deleteRecord=async id=>{
+    const rec=records.find(r=>r.id===id);
+    if(rec)for(const a of rec.archivos)await db.del(a.key);
+    const list=records.filter(r=>r.id!==id);setRecords(list);await db.set(K.R,list);
+  };
+
+  if(loading)return(
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:'#f0f4f8',flexDirection:'column',gap:12}}>
+      <style>{`@keyframes sp{to{transform:rotate(360deg)}}`}</style>
+      <div style={{width:36,height:36,border:'3px solid '+OG,borderTopColor:'transparent',borderRadius:'50%',animation:'sp 0.7s linear infinite'}}/>
+      <p style={{color:OG,fontWeight:700,margin:0}}>Cargando sistema...</p>
+    </div>
+  );
+
+  if(!user)return <AuthScreen onLogin={login} onRegister={register} onRequestAccess={requestAccess} contacts={contacts}/>;
+
+  const isAdmin=user.role==='admin';
+  const TABS=[
+    {k:'nuevo',l:'➕ Nuevo Sustento'},
+    {k:'bandeja',l:'📂 Bandeja ('+records.length+')'},
+    {k:'cruce',l:'🔄 Cruce SAP'},
+    ...(isAdmin?[{k:'admin',l:'⚙️ Admin'+(pending.length>0?' 🔴':'')}]:[])
+  ];
+
+  return(
+    <div style={{fontFamily:'Segoe UI,system-ui,sans-serif',minHeight:'100vh',background:'#f0f4f8'}}>
+      <header style={{background:'linear-gradient(135deg,'+BL+','+BL2+')',padding:'0 20px',boxShadow:'0 2px 12px rgba(0,0,0,0.2)'}}>
+        <div style={{maxWidth:1180,margin:'0 auto'}}>
+          <div style={{padding:'12px 0 0',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+            <div style={{display:'flex',alignItems:'center',gap:12}}>
+              <div style={{background:'rgba(255,255,255,0.15)',borderRadius:8,padding:'5px 9px',fontSize:20}}>🏢</div>
+              <div>
+                <div style={{fontWeight:800,fontSize:15,color:'white'}}>SODIMAC · Finanzas</div>
+                <div style={{fontSize:11,opacity:.75,color:'white'}}>Gestión de Sustentos de Devoluciones — Cuentas por Cobrar</div>
+              </div>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:10}}>
+              <div style={{textAlign:'right',color:'rgba(255,255,255,0.9)'}}>
+                <div style={{fontWeight:700,fontSize:13}}>{user.name}</div>
+                <div style={{fontSize:11,opacity:.75}}>{user.email}</div>
+              </div>
+              <button onClick={()=>setUser(null)} style={{padding:'6px 12px',background:'rgba(255,255,255,0.2)',color:'white',border:'none',borderRadius:6,cursor:'pointer',fontSize:12,fontFamily:'inherit'}}>🚪 Salir</button>
+            </div>
+          </div>
+          <nav style={{display:'flex',gap:3,marginTop:10}}>
+            {TABS.map(t=>(
+              <button key={t.k} onClick={()=>setTab(t.k)} style={{padding:'9px 18px',border:'none',cursor:'pointer',background:tab===t.k?'white':'transparent',color:tab===t.k?BL:'white',fontWeight:tab===t.k?700:400,borderRadius:'7px 7px 0 0',fontSize:13,fontFamily:'inherit'}}>{t.l}</button>
+            ))}
+          </nav>
+        </div>
+      </header>
+      <main style={{maxWidth:1180,margin:'0 auto',padding:'22px 20px'}}>
+        {toast&&(
+          <div style={{position:'fixed',top:18,right:18,zIndex:9999,background:toast.type==='ok'?'#22c55e':toast.type==='err'?'#ef4444':'#f59e0b',color:'white',padding:'11px 20px',borderRadius:8,fontWeight:700,fontSize:14,boxShadow:'0 4px 12px rgba(0,0,0,0.2)'}}>
+            {toast.type==='ok'?'✅':toast.type==='err'?'❌':'⚠️'} {toast.msg}
+          </div>
+        )}
+        {tab==='nuevo'&&<NuevoSustento tiendas={tiendas} provs={provs} onAdd={addRecord} notify={notify}/>}
+        {tab==='bandeja'&&<Bandeja records={records} onDelete={deleteRecord} notify={notify}/>}
+        {tab==='cruce'&&<CruceSAP records={records}/>}
+        {tab==='admin'&&isAdmin&&<Admin tiendas={tiendas} provs={provs} saveT={async l=>{setTiendas(l);await db.set(K.T,l);}} saveP={async l=>{setProvs(l);await db.set(K.P,l);}} contacts={contacts} saveCont={async l=>{setContacts(l);await db.set(K.CONT,l);}} users={users} pending={pending} onApprove={approveUser} onReject={rejectUser} notify={notify}/>}
+      </main>
+    </div>
+  );
+}
+
+// ── Auth Screen ────────────────────────────────────────────────────────────
+function AuthScreen({onLogin,onRegister,onRequestAccess,contacts}){
+  const [view,setView]=useState('login');
+  const [form,setForm]=useState({name:'',email:'',password:'',confirm:'',reason:''});
+  const [error,setError]=useState('');
+  const [success,setSuccess]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [notCorp,setNotCorp]=useState(false);
+  const sf=(k,v)=>setForm(f=>({...f,[k]:v}));
+
+  const authInp={width:'100%',padding:'11px 14px',border:'1.5px solid #d1d5db',borderRadius:8,fontSize:14,outline:'none',boxSizing:'border-box',fontFamily:'inherit',color:'#111',background:'white'};
+  const btnPrimary={padding:13,background:'linear-gradient(135deg,'+OG+',#E5500A)',color:'white',border:'none',borderRadius:8,cursor:'pointer',fontWeight:800,fontSize:15,fontFamily:'inherit',width:'100%'};
+
+  const doLogin=async()=>{
+    if(!form.email||!form.password){setError('Complete todos los campos');return;}
+    setBusy(true);setError('');
+    const err=await onLogin(form.email,form.password);
+    if(err)setError(err);
+    setBusy(false);
+  };
+
+  const doRegister=async()=>{
+    if(!form.name||!form.email||!form.password){setError('Complete todos los campos');return;}
+    if(form.password!==form.confirm){setError('Las contraseñas no coinciden');return;}
+    if(form.password.length<6){setError('Contraseña mínimo 6 caracteres');return;}
+    setBusy(true);setError('');
+    const err=await onRegister(form.name,form.email,form.password);
+    if(err==='NOT_CORP'){setNotCorp(true);setBusy(false);return;}
+    if(err)setError(err);
+    setBusy(false);
+  };
+
+  const doRequest=async()=>{
+    if(!form.name||!form.email){setError('Completa nombre y correo');return;}
+    setBusy(true);setError('');
+    const err=await onRequestAccess(form.name,form.email,form.reason);
+    if(err)setError(err);
+    else setSuccess('¡Solicitud enviada! Un administrador revisará tu pedido.');
+    setBusy(false);
+  };
+
+  const pageBg={minHeight:'100vh',background:'linear-gradient(135deg,#FF6B00 0%,#E5500A 60%,#CC3F00 100%)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:20};
+  const box={background:'white',borderRadius:16,padding:32,maxWidth:440,width:'100%',boxShadow:'0 20px 60px rgba(0,0,0,0.3)'};
+
+  if(notCorp)return(
+    <div style={pageBg}>
+      <div style={{...box,maxWidth:500}}>
+        <div style={{textAlign:'center',marginBottom:20}}>
+          <div style={{fontSize:48}}>🔒</div>
+          <h2 style={{color:BL,margin:'8px 0 4px'}}>Acceso Restringido</h2>
+          <p style={{color:'#6b7280',fontSize:13,margin:0}}>Tu correo no es corporativo Sodimac/Falabella. Debes solicitar acceso a uno de estos administradores:</p>
+        </div>
+        {contacts.length>0?contacts.map((c,i)=>(
+          <div key={c.id} style={{display:'flex',alignItems:'center',gap:12,padding:'12px 16px',background:'#f8fafc',borderRadius:8,marginBottom:8,border:'1px solid #e5e7eb'}}>
+            <div style={{background:'#dbeafe',color:'#1e40af',borderRadius:'50%',width:36,height:36,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,flexShrink:0}}>{i+1}</div>
+            <div>
+              <div style={{fontWeight:700,fontSize:13}}>{c.name}</div>
+              <a href={'mailto:'+c.email} style={{fontSize:12,color:'#2563eb',textDecoration:'none'}}>📧 {c.email}</a>
+            </div>
+          </div>
+        )):<p style={{textAlign:'center',color:'#9ca3af',fontSize:13,padding:'16px 0'}}>Sin contactos configurados. Comuníquese con el administrador del sistema.</p>}
+        <div style={{margin:'12px 0',padding:10,background:'#fef3c7',borderRadius:8,fontSize:12,color:'#92400e'}}>⚠ Si ningún contacto te aprueba, no podrás ingresar al sistema.</div>
+        <button onClick={()=>{setNotCorp(false);setView('request');}} style={{...btnPrimary,marginBottom:8}}>📩 Enviar Solicitud Formal</button>
+        <button onClick={()=>setNotCorp(false)} style={{...btnPrimary,background:'white',color:'#374151',border:'1.5px solid #d1d5db'}}>← Volver</button>
+      </div>
+    </div>
+  );
+
+  return(
+    <div style={pageBg}>
+      <div style={{textAlign:'center',marginBottom:24,color:'white'}}>
+        <div style={{fontSize:44,marginBottom:6}}>🏗️</div>
+        <div style={{fontSize:36,fontWeight:900,letterSpacing:4,textShadow:'0 2px 8px rgba(0,0,0,0.3)'}}>SODIMAC</div>
+        <div style={{fontSize:12,opacity:.85,letterSpacing:1.5,marginTop:4}}>SISTEMA DE GESTIÓN DE DEVOLUCIONES</div>
+      </div>
+      <div style={box}>
+        {view!=='request'&&(
+          <div style={{display:'flex',background:'#f3f4f6',borderRadius:8,padding:4,marginBottom:22}}>
+            {[['login','Iniciar Sesión'],['register','Crear Cuenta']].map(([k,l])=>(
+              <button key={k} onClick={()=>{setView(k);setError('');setSuccess('');}} style={{flex:1,padding:'8px',border:'none',background:view===k?'white':'transparent',borderRadius:6,cursor:'pointer',fontWeight:view===k?700:400,fontSize:13,color:view===k?BL:'#6b7280',fontFamily:'inherit'}}>{l}</button>
+            ))}
+          </div>
+        )}
+        {error&&<div style={{marginBottom:14,padding:'10px 14px',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:8,color:'#dc2626',fontSize:13,fontWeight:600}}>❌ {error}</div>}
+        {success&&<div style={{marginBottom:14,padding:'10px 14px',background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,color:'#166534',fontSize:13,fontWeight:600}}>✅ {success}</div>}
+
+        {view==='login'&&(
+          <div style={{display:'flex',flexDirection:'column',gap:14}}>
+            <div><label style={{...lblS,fontSize:13}}>Correo corporativo</label><input type="email" value={form.email} onChange={e=>sf('email',e.target.value)} onKeyDown={e=>e.key==='Enter'&&doLogin()} placeholder="nombre@sodimac.com" style={authInp}/></div>
+            <div><label style={{...lblS,fontSize:13}}>Contraseña</label><input type="password" value={form.password} onChange={e=>sf('password',e.target.value)} onKeyDown={e=>e.key==='Enter'&&doLogin()} placeholder="••••••••" style={authInp}/></div>
+            <button onClick={doLogin} disabled={busy} style={{...btnPrimary,background:busy?'#fed7aa':'linear-gradient(135deg,'+OG+',#E5500A)',cursor:busy?'not-allowed':'pointer'}}>
+              {busy?'⏳ Ingresando...':'🔐 INGRESAR'}
+            </button>
+            <div style={{textAlign:'center',fontSize:12,color:'#6b7280'}}>¿Sin acceso? <button onClick={()=>setView('request')} style={{background:'none',border:'none',color:OG,cursor:'pointer',fontWeight:700,fontSize:12,fontFamily:'inherit'}}>Solicitar acceso</button></div>
+          </div>
+        )}
+
+        {view==='register'&&(
+          <div style={{display:'flex',flexDirection:'column',gap:14}}>
+            <div><label style={{...lblS,fontSize:13}}>Nombre completo</label><input value={form.name} onChange={e=>sf('name',e.target.value)} placeholder="Tu nombre completo" style={authInp}/></div>
+            <div>
+              <label style={{...lblS,fontSize:13}}>Correo corporativo</label>
+              <input type="email" value={form.email} onChange={e=>sf('email',e.target.value)} placeholder="nombre@sodimac.com" style={authInp}/>
+              <span style={{fontSize:11,color:'#6b7280',marginTop:2,display:'block'}}>Solo @sodimac.com o @falabella.com</span>
+            </div>
+            <div><label style={{...lblS,fontSize:13}}>Contraseña</label><input type="password" value={form.password} onChange={e=>sf('password',e.target.value)} placeholder="Mínimo 6 caracteres" style={authInp}/></div>
+            <div><label style={{...lblS,fontSize:13}}>Confirmar contraseña</label><input type="password" value={form.confirm} onChange={e=>sf('confirm',e.target.value)} onKeyDown={e=>e.key==='Enter'&&doRegister()} placeholder="Repite la contraseña" style={authInp}/></div>
+            <button onClick={doRegister} disabled={busy} style={{...btnPrimary,cursor:busy?'not-allowed':'pointer',background:busy?'#fed7aa':'linear-gradient(135deg,'+OG+',#E5500A)'}}>
+              {busy?'⏳ Creando cuenta...':'✅ CREAR CUENTA'}
+            </button>
+          </div>
+        )}
+
+        {view==='request'&&(
+          <div style={{display:'flex',flexDirection:'column',gap:14}}>
+            <h3 style={{margin:0,color:BL,fontSize:16}}>📩 Solicitar Acceso</h3>
+            <div style={{padding:10,background:'#fef3c7',borderRadius:8,fontSize:12,color:'#92400e'}}>Un administrador revisará tu solicitud y te asignará las credenciales de acceso.</div>
+            {contacts.length>0&&(
+              <div>
+                <p style={{fontSize:11,fontWeight:700,color:'#374151',margin:'0 0 6px'}}>Contactos administradores:</p>
+                {contacts.map(c=>(
+                  <div key={c.id} style={{display:'flex',gap:8,padding:'6px 10px',background:'#f8fafc',borderRadius:6,marginBottom:4,alignItems:'center'}}>
+                    <span style={{fontSize:11,fontWeight:700,color:'#374151',minWidth:80}}>{c.name}:</span>
+                    <a href={'mailto:'+c.email} style={{fontSize:11,color:'#2563eb'}}>{c.email}</a>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div><label style={{...lblS,fontSize:13}}>Nombre completo</label><input value={form.name} onChange={e=>sf('name',e.target.value)} placeholder="Tu nombre" style={authInp}/></div>
+            <div><label style={{...lblS,fontSize:13}}>Tu correo</label><input type="email" value={form.email} onChange={e=>sf('email',e.target.value)} placeholder="tu@correo.com" style={authInp}/></div>
+            <div><label style={{...lblS,fontSize:13}}>Motivo (opcional)</label><textarea value={form.reason} onChange={e=>sf('reason',e.target.value)} placeholder="¿Por qué necesitas acceso?" style={{...authInp,resize:'vertical',minHeight:70}}/></div>
+            <button onClick={doRequest} disabled={busy} style={{...btnPrimary,cursor:busy?'not-allowed':'pointer',background:busy?'#93c5fd':'linear-gradient(135deg,'+BL+','+BL2+')'}}>
+              {busy?'⏳ Enviando...':'📩 ENVIAR SOLICITUD'}
+            </button>
+            <button onClick={()=>{setView('login');setError('');setSuccess('');}} style={{...btnPrimary,background:'white',color:'#374151',border:'1.5px solid #d1d5db'}}>← Volver al inicio de sesión</button>
+          </div>
+        )}
+      </div>
+      <p style={{color:'rgba(255,255,255,0.6)',fontSize:11,marginTop:16}}>© Sodimac · Área de Finanzas — Cuentas por Cobrar</p>
+    </div>
+  );
+}
+
+// ── Nuevo Sustento ─────────────────────────────────────────────────────────
+function NuevoSustento({tiendas,provs,onAdd,notify}){
+  const E={tienda:'',proveedor:'',nroGuia:'',nroCartaPorte:'',nc:'',serie:'',modelo:'',fechaAdjunto:''};
+  const [form,setForm]=useState(E);
+  const [files,setFiles]=useState([]);
+  const [errors,setErrors]=useState({});
+  const [busy,setBusy]=useState(false);
+  const fileRef=useRef();
+
+  const set=(k,v)=>{setForm(f=>({...f,[k]:v}));setErrors(e=>({...e,[k]:''}));};
+
+  const handleCP=e=>{
+    const v=e.target.value.replace(/\D/g,'').slice(0,5);
+    setForm(f=>({...f,nroCartaPorte:v}));
+    setErrors(er=>({...er,nroCartaPorte:''}));
+  };
+
+  const handleFiles=e=>{
+    const arr=Array.from(e.target.files||[]);
+    if(arr.length>0){setFiles(f=>[...f,...arr]);setErrors(er=>({...er,files:''}));}
+    e.target.value='';
+  };
+
+  const validate=()=>{
+    const e={};
+    if(!form.tienda)e.tienda='Seleccione una tienda';
+    if(!form.proveedor)e.proveedor='Seleccione un proveedor';
+    if(!form.nroGuia.trim())e.nroGuia='Campo requerido';
+    if(!form.nroCartaPorte)e.nroCartaPorte='Campo requerido';
+    else if(form.nroCartaPorte.length!==5)e.nroCartaPorte='Debe tener exactamente 5 dígitos';
+    if(!form.fechaAdjunto)e.fechaAdjunto='Seleccione una fecha';
+    if(files.length===0)e.files='Debe adjuntar al menos un archivo sustento';
+    setErrors(e);return Object.keys(e).length===0;
+  };
+
+  const submit=async()=>{
+    if(!validate())return;
+    setBusy(true);
+    try{await onAdd({id:uid(),...form,createdAt:new Date().toISOString()},files);setForm(E);setFiles([]);notify('Sustento registrado exitosamente');}
+    catch{notify('Error al guardar. Intente nuevamente.','err');}
+    setBusy(false);
+  };
+
+  return(
+    <div style={cardS}>
+      <div style={hdS}>
+        <h2 style={{margin:0,fontSize:17,fontWeight:800}}>➕ Registro de Nuevo Sustento</h2>
+        <p style={{margin:'3px 0 0',fontSize:12,opacity:.8}}>Campos (*) obligatorios. No se puede guardar sin adjuntar al menos un archivo.</p>
+      </div>
+      <div style={{padding:24}}>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:16}}>
+          <Field label="Tienda" req error={errors.tienda}>
+            <select value={form.tienda} onChange={e=>set('tienda',e.target.value)} style={inpS(errors.tienda)}>
+              <option value="">— Seleccione —</option>{tiendas.map(o=><option key={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Proveedor" req error={errors.proveedor}>
+            <select value={form.proveedor} onChange={e=>set('proveedor',e.target.value)} style={inpS(errors.proveedor)}>
+              <option value="">— Seleccione —</option>{provs.map(o=><option key={o}>{o}</option>)}
+            </select>
+          </Field>
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:16}}>
+          <Field label="Nro. Guía" req error={errors.nroGuia}>
+            <input value={form.nroGuia} onChange={e=>set('nroGuia',e.target.value)} placeholder="Alfanumérico (ej: G-001234)" style={inpS(errors.nroGuia)}/>
+          </Field>
+          <Field label="Nro. Carta Porte (5 dígitos)" req error={errors.nroCartaPorte}>
+            <input value={form.nroCartaPorte} onChange={handleCP} placeholder="Ej: 12345" inputMode="numeric" maxLength={5} style={inpS(errors.nroCartaPorte)}/>
+            <span style={{fontSize:10,color:'#6b7280',marginTop:2,display:'block'}}>{form.nroCartaPorte.length}/5 dígitos</span>
+          </Field>
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:16}}>
+          <Field label="NC / Nota de Crédito">
+            <input value={form.nc} onChange={e=>set('nc',e.target.value)} placeholder="Número de Nota de Crédito" style={inpS(false)}/>
+          </Field>
+          <Field label="Fecha de Adjunto" req error={errors.fechaAdjunto}>
+            <input type="date" value={form.fechaAdjunto} onChange={e=>set('fechaAdjunto',e.target.value)} style={inpS(errors.fechaAdjunto)}/>
+          </Field>
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:24}}>
+          <Field label="Serie">
+            <input value={form.serie} onChange={e=>set('serie',e.target.value)} placeholder="Serie del producto" style={inpS(false)}/>
+          </Field>
+          <Field label="Modelo">
+            <input value={form.modelo} onChange={e=>set('modelo',e.target.value)} placeholder="Modelo del producto" style={inpS(false)}/>
+          </Field>
+        </div>
+
+        <div style={{marginBottom:24}}>
+          <label style={{...lblS,fontSize:13}}>Sustentos — Archivos Adjuntos <span style={{color:'#ef4444'}}>*</span></label>
+          <div style={{border:'2.5px dashed '+(errors.files?'#ef4444':'#93c5fd'),borderRadius:10,padding:'22px 20px',textAlign:'center',background:errors.files?'#fef2f2':'#eff6ff'}}>
+            <div style={{fontSize:36,marginBottom:6}}>📎</div>
+            <p style={{margin:'0 0 10px',fontWeight:700,color:'#1e40af',fontSize:14}}>Seleccione los archivos a adjuntar</p>
+            <p style={{margin:'0 0 12px',fontSize:11,color:'#6b7280'}}>PDF, imágenes, Excel, Word — puede adjuntar múltiples archivos</p>
+            <button type="button" onClick={()=>fileRef.current&&fileRef.current.click()} style={{padding:'9px 24px',background:BL,color:'white',border:'none',borderRadius:7,cursor:'pointer',fontWeight:700,fontSize:13,fontFamily:'inherit'}}>📂 Elegir archivos</button>
+            <input ref={fileRef} type="file" multiple onChange={handleFiles} style={{display:'none'}}/>
+          </div>
+          {errors.files&&<div style={{color:'#ef4444',fontSize:12,fontWeight:600,marginTop:6,padding:'8px 12px',background:'#fef2f2',borderRadius:6,border:'1px solid #fecaca'}}>⚠ {errors.files}</div>}
+          {files.length>0&&(
+            <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:6}}>
+              <p style={{margin:'0 0 4px',fontSize:12,fontWeight:700,color:'#374151'}}>{files.length} archivo(s) listo(s):</p>
+              {files.map((f,i)=>(
+                <div key={i} style={{display:'flex',alignItems:'center',gap:8,background:'#f8fafc',border:'1px solid #e5e7eb',borderRadius:7,padding:'8px 12px'}}>
+                  <span style={{fontSize:20}}>{fIcon(f.name)}</span>
+                  <span style={{flex:1,fontSize:13,color:'#374151',fontWeight:500}}>{f.name}</span>
+                  <span style={{fontSize:11,color:'#6b7280'}}>{fmtSz(f.size)}</span>
+                  <button type="button" onClick={()=>setFiles(fl=>fl.filter((_,j)=>j!==i))} style={{border:'none',background:'none',color:'#ef4444',cursor:'pointer',fontSize:20,lineHeight:1,padding:'0 3px'}}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <button type="button" onClick={submit} disabled={busy} style={{width:'100%',padding:14,background:busy?'#93c5fd':'linear-gradient(135deg,'+BL+','+BL2+')',color:'white',border:'none',borderRadius:8,fontSize:15,fontWeight:800,cursor:busy?'not-allowed':'pointer',fontFamily:'inherit'}}>
+          {busy?'⏳ Guardando sustento...':'💾 GUARDAR SUSTENTO'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Bandeja ────────────────────────────────────────────────────────────────
+function Bandeja({records,onDelete,notify}){
+  const EF={tienda:'',proveedor:'',nroGuia:'',nroCartaPorte:'',nc:'',serie:'',modelo:'',fD:'',fH:'',q:''};
+  const [f,setFil]=useState(EF);
+  const [delModal,setDel]=useState(null);
+  const [viewRec,setViewRec]=useState(null);
+  const [fileCache,setFC]=useState({});
+  const [fcLoad,setFCL]=useState(false);
+
+  const sf=(k,v)=>setFil(x=>({...x,[k]:v}));
+
+  const filtered=records.filter(r=>{
+    if(f.tienda&&r.tienda!==f.tienda)return false;
+    if(f.proveedor&&r.proveedor!==f.proveedor)return false;
+    if(f.nroGuia&&!r.nroGuia?.toLowerCase().includes(f.nroGuia.toLowerCase()))return false;
+    if(f.nroCartaPorte&&!r.nroCartaPorte?.toLowerCase().includes(f.nroCartaPorte.toLowerCase()))return false;
+    if(f.nc&&!r.nc?.toLowerCase().includes(f.nc.toLowerCase()))return false;
+    if(f.serie&&!r.serie?.toLowerCase().includes(f.serie.toLowerCase()))return false;
+    if(f.modelo&&!r.modelo?.toLowerCase().includes(f.modelo.toLowerCase()))return false;
+    if(f.fD&&r.fechaAdjunto<f.fD)return false;
+    if(f.fH&&r.fechaAdjunto>f.fH)return false;
+    if(f.q){const q=f.q.toLowerCase();return[r.tienda,r.proveedor,r.nroGuia,r.nroCartaPorte,r.nc,r.serie,r.modelo,r.uploadedBy,r.uploadedEmail].some(v=>v?.toLowerCase().includes(q));}
+    return true;
+  });
+
+  const uniqT=[...new Set(records.map(r=>r.tienda))];
+  const uniqP=[...new Set(records.map(r=>r.proveedor))];
+
+  const openFiles=async rec=>{
+    setViewRec(rec);setFCL(true);
+    const cache={};
+    for(const a of rec.archivos)cache[a.key]=await db.get(a.key);
+    setFC(cache);setFCL(false);
+  };
+
+  const download=(arch,stored)=>{const a=document.createElement('a');a.href=stored.data;a.download=arch.name;a.click();};
+
+  const confirmDel=async()=>{
+    if(delModal.step===1){setDel(d=>({...d,step:2}));return;}
+    await onDelete(delModal.id);setDel(null);notify('Registro eliminado');
+  };
+
+  const is={padding:'8px 10px',border:'1.5px solid #d1d5db',borderRadius:6,fontSize:12,outline:'none',background:'white',color:'#111',width:'100%',boxSizing:'border-box',fontFamily:'inherit'};
+  const today=new Date().toISOString().slice(0,10);
+  const thisMo=records.filter(r=>r.fechaAdjunto?.slice(0,7)===today.slice(0,7)).length;
+
+  return(
+    <div>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:14,marginBottom:20}}>
+        {[{icon:'📂',label:'Total Sustentos',val:records.length,bg:'#dbeafe',fg:'#1e40af'},{icon:'📅',label:'Este Mes',val:thisMo,bg:'#dcfce7',fg:'#166534'},{icon:'🏪',label:'Tiendas Activas',val:new Set(records.map(r=>r.tienda)).size,bg:'#fef3c7',fg:'#92400e'}].map(s=>(
+          <div key={s.label} style={{background:'white',borderRadius:10,padding:'14px 18px',boxShadow:'0 1px 4px rgba(0,0,0,0.07)',display:'flex',alignItems:'center',gap:14}}>
+            <div style={{background:s.bg,color:s.fg,borderRadius:8,padding:'10px 12px',fontSize:22}}>{s.icon}</div>
+            <div><div style={{fontSize:26,fontWeight:900,color:s.fg}}>{s.val}</div><div style={{fontSize:11,color:'#6b7280',fontWeight:600}}>{s.label}</div></div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{...cardS,marginBottom:20}}>
+        <div style={{padding:'13px 20px',borderBottom:'1px solid #f3f4f6',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+          <span style={{fontWeight:800,color:BL,fontSize:14}}>🔍 Filtros</span>
+          <button onClick={()=>setFil(EF)} style={{padding:'5px 12px',border:'1px solid #d1d5db',borderRadius:6,background:'white',cursor:'pointer',fontSize:12,fontFamily:'inherit'}}>🔄 Limpiar</button>
+        </div>
+        <div style={{padding:'14px 20px'}}>
+          <input value={f.q} onChange={e=>sf('q',e.target.value)} placeholder="🔎 Búsqueda general en todos los campos..." style={{...is,fontSize:13,padding:'10px 12px',marginBottom:12}}/>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:10}}>
+            <div><label style={lblS}>Tienda</label><select value={f.tienda} onChange={e=>sf('tienda',e.target.value)} style={is}><option value="">Todas</option>{uniqT.map(t=><option key={t}>{t}</option>)}</select></div>
+            <div><label style={lblS}>Proveedor</label><select value={f.proveedor} onChange={e=>sf('proveedor',e.target.value)} style={is}><option value="">Todos</option>{uniqP.map(p=><option key={p}>{p}</option>)}</select></div>
+            <div><label style={lblS}>Nro. Guía</label><input value={f.nroGuia} onChange={e=>sf('nroGuia',e.target.value)} placeholder="Filtrar..." style={is}/></div>
+            <div><label style={lblS}>Carta Porte</label><input value={f.nroCartaPorte} onChange={e=>sf('nroCartaPorte',e.target.value)} placeholder="Filtrar..." style={is}/></div>
+            <div><label style={lblS}>NC</label><input value={f.nc} onChange={e=>sf('nc',e.target.value)} placeholder="Filtrar..." style={is}/></div>
+            <div><label style={lblS}>Serie</label><input value={f.serie} onChange={e=>sf('serie',e.target.value)} placeholder="Filtrar..." style={is}/></div>
+            <div><label style={lblS}>Modelo</label><input value={f.modelo} onChange={e=>sf('modelo',e.target.value)} placeholder="Filtrar..." style={is}/></div>
+            <div><label style={lblS}>Fecha Desde</label><input type="date" value={f.fD} onChange={e=>sf('fD',e.target.value)} style={is}/></div>
+            <div><label style={lblS}>Fecha Hasta</label><input type="date" value={f.fH} onChange={e=>sf('fH',e.target.value)} style={is}/></div>
+          </div>
+        </div>
+      </div>
+
+      <div style={cardS}>
+        <div style={{padding:'13px 20px',borderBottom:'1px solid #f3f4f6',display:'flex',alignItems:'center',gap:8}}>
+          <span style={{fontWeight:800,color:BL,fontSize:14}}>📋 Sustentos Registrados</span>
+          <span style={{background:'#dbeafe',color:'#1e40af',padding:'2px 8px',borderRadius:20,fontSize:11,fontWeight:700}}>{filtered.length} de {records.length}</span>
+        </div>
+        {filtered.length===0?(
+          <div style={{padding:48,textAlign:'center',color:'#9ca3af'}}>
+            <div style={{fontSize:48}}>📋</div>
+            <p style={{fontWeight:700,margin:'8px 0 4px'}}>{records.length===0?'Sin sustentos registrados':'Sin resultados con los filtros aplicados'}</p>
+          </div>
+        ):(
+          <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',minWidth:1100}}>
+              <thead>
+                <tr style={{background:'#f8fafc',borderBottom:'2px solid #e5e7eb'}}>
+                  {['#','Tienda','Proveedor','Nro. Guía','Carta Porte','NC','Fecha','Serie','Modelo','Subido por','Arch.','Acciones'].map(h=>(
+                    <th key={h} style={{padding:'10px 12px',textAlign:'left',color:'#374151',fontWeight:800,fontSize:11,whiteSpace:'nowrap'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((r,i)=>(
+                  <tr key={r.id} style={{background:i%2===0?'white':'#fafafa',borderBottom:'1px solid #f3f4f6'}}>
+                    <td style={{padding:'9px 12px',color:'#9ca3af',fontWeight:700,fontSize:12}}>{i+1}</td>
+                    <td style={{padding:'9px 12px',fontWeight:600,fontSize:12,whiteSpace:'nowrap'}}>{r.tienda}</td>
+                    <td style={{padding:'9px 12px',fontSize:12,whiteSpace:'nowrap'}}>{r.proveedor}</td>
+                    <td style={{padding:'9px 12px',fontFamily:'monospace',color:'#1e40af',fontSize:12,whiteSpace:'nowrap'}}>{r.nroGuia}</td>
+                    <td style={{padding:'9px 12px',fontFamily:'monospace',color:'#1e40af',fontWeight:700,fontSize:12,whiteSpace:'nowrap'}}>{r.nroCartaPorte}</td>
+                    <td style={{padding:'9px 12px',color:'#6b7280',fontSize:12,whiteSpace:'nowrap'}}>{r.nc||'—'}</td>
+                    <td style={{padding:'9px 12px',fontSize:12,whiteSpace:'nowrap'}}>{fmtD(r.fechaAdjunto)}</td>
+                    <td style={{padding:'9px 12px',color:'#6b7280',fontSize:12,whiteSpace:'nowrap'}}>{r.serie||'—'}</td>
+                    <td style={{padding:'9px 12px',color:'#6b7280',fontSize:12,whiteSpace:'nowrap'}}>{r.modelo||'—'}</td>
+                    <td style={{padding:'9px 12px',whiteSpace:'nowrap',minWidth:160}}>
+                      <div style={{fontSize:12,fontWeight:600,color:'#374151'}}>{r.uploadedBy||'—'}</div>
+                      {r.uploadedEmail&&<a href={'mailto:'+r.uploadedEmail} title="Abrir en Outlook" style={{fontSize:11,color:'#2563eb',textDecoration:'none'}}>📧 {r.uploadedEmail}</a>}
+                    </td>
+                    <td style={{padding:'9px 12px',whiteSpace:'nowrap'}}>
+                      <span style={{background:'#dcfce7',color:'#166534',padding:'3px 8px',borderRadius:20,fontSize:11,fontWeight:700}}>🟢 {r.archivos.length}</span>
+                    </td>
+                    <td style={{padding:'9px 12px',whiteSpace:'nowrap'}}>
+                      <div style={{display:'flex',gap:6}}>
+                        <button onClick={()=>openFiles(r)} style={{padding:'5px 10px',background:'#dbeafe',color:'#1e40af',border:'none',borderRadius:5,cursor:'pointer',fontSize:11,fontWeight:700,fontFamily:'inherit'}}>👁 Ver</button>
+                        <button onClick={()=>setDel({id:r.id,rec:r,step:1})} style={{padding:'5px 10px',background:'#fee2e2',color:'#dc2626',border:'none',borderRadius:5,cursor:'pointer',fontSize:11,fontWeight:700,fontFamily:'inherit'}}>🗑 Eliminar</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {delModal&&(
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:999}}>
+          <div style={{background:'white',borderRadius:14,padding:32,maxWidth:470,width:'92%',boxShadow:'0 24px 60px rgba(0,0,0,0.35)'}}>
+            <div style={{textAlign:'center',marginBottom:22}}>
+              <div style={{fontSize:52}}>{delModal.step===1?'⚠️':'🚨'}</div>
+              <h3 style={{color:'#dc2626',margin:'8px 0 6px',fontSize:18}}>{delModal.step===1?'¿Eliminar este sustento?':'Confirmación Final'}</h3>
+              <p style={{color:'#374151',margin:0,fontSize:14,lineHeight:1.65}}>
+                {delModal.step===1
+                  ?'Está a punto de eliminar el sustento de '+delModal.rec.tienda+' · CP: '+delModal.rec.nroCartaPorte
+                  :'⚠ ACCIÓN IRREVERSIBLE. El registro y sus archivos se eliminarán de forma permanente.'}
+              </p>
+            </div>
+            <div style={{display:'flex',gap:12}}>
+              <button onClick={()=>setDel(null)} style={{flex:1,padding:12,border:'1.5px solid #d1d5db',borderRadius:8,background:'white',cursor:'pointer',fontWeight:700,fontSize:14,fontFamily:'inherit'}}>Cancelar</button>
+              <button onClick={confirmDel} style={{flex:1,padding:12,background:'#dc2626',color:'white',border:'none',borderRadius:8,cursor:'pointer',fontWeight:800,fontSize:14,fontFamily:'inherit'}}>{delModal.step===1?'Sí, Eliminar':'✓ CONFIRMAR'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewRec&&(
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:999}}>
+          <div style={{background:'white',borderRadius:14,maxWidth:530,width:'92%',maxHeight:'88vh',overflow:'hidden',display:'flex',flexDirection:'column',boxShadow:'0 24px 60px rgba(0,0,0,0.35)'}}>
+            <div style={{...hdS,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <div>
+                <div style={{fontWeight:800,fontSize:15}}>📎 Archivos Adjuntos</div>
+                <div style={{fontSize:11,opacity:.8}}>{viewRec.tienda} · CP: {viewRec.nroCartaPorte}</div>
+              </div>
+              <button onClick={()=>{setViewRec(null);setFC({});}} style={{border:'none',background:'rgba(255,255,255,0.2)',color:'white',cursor:'pointer',borderRadius:6,padding:'4px 10px',fontSize:20}}>×</button>
+            </div>
+            <div style={{padding:20,overflowY:'auto'}}>
+              {fcLoad?<p style={{textAlign:'center',color:'#6b7280'}}>⏳ Cargando...</p>:
+                viewRec.archivos.map((a,i)=>{
+                  const stored=fileCache[a.key];
+                  return(
+                    <div key={i} style={{display:'flex',alignItems:'center',gap:12,padding:12,background:'#f8fafc',borderRadius:8,marginBottom:8,border:'1px solid #e5e7eb'}}>
+                      <span style={{fontSize:28}}>{fIcon(a.name)}</span>
+                      <div style={{flex:1}}>
+                        <p style={{margin:0,fontSize:13,fontWeight:700,color:'#374151'}}>{a.name}</p>
+                        <p style={{margin:0,fontSize:11,color:'#6b7280'}}>{fmtSz(a.size)}</p>
+                      </div>
+                      {stored?<button onClick={()=>download(a,stored)} style={{padding:'7px 14px',background:BL,color:'white',border:'none',borderRadius:6,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>⬇ Descargar</button>:<span style={{fontSize:12,color:'#9ca3af'}}>No disponible</span>}
+                    </div>
+                  );
+                })
+              }
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Cruce SAP ──────────────────────────────────────────────────────────────
+function CruceSAP({records}){
+  const [sapRows,setSap]=useState(null);
+  const [headers,setHdrs]=useState([]);
+  const [cpCol,setCpCol]=useState('');
+  const [results,setRes]=useState(null);
+  const [view,setView]=useState('all');
+  const ref=useRef();
+
+  const loadXLS=e=>{
+    const file=e.target.files[0];if(!file)return;
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      try{
+        const wb=XLSX.read(ev.target.result,{type:'binary'});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const raw=XLSX.utils.sheet_to_json(ws,{header:1});
+        if(raw.length<2){alert('Archivo sin datos suficientes.');return;}
+        const hdrs=raw[0].map(h=>String(h!=null?h:''));
+        const rows=raw.slice(1).map(row=>Object.fromEntries(hdrs.map((h,i)=>[h,row[i]!=null?row[i]:'']))).filter(row=>Object.values(row).some(v=>v!==''));
+        setHdrs(hdrs);setSap(rows);setRes(null);
+        const auto=hdrs.find(h=>/carta|porte|cp\b/i.test(h));
+        setCpCol(auto||hdrs[0]||'');
+      }catch{alert('Error al leer el Excel.');}
+    };
+    reader.readAsBinaryString(file);e.target.value='';
+  };
+
+  const run=()=>{
+    const cps=new Set(records.map(r=>r.nroCartaPorte?r.nroCartaPorte.trim().toLowerCase():''));
+    const crossed=sapRows.map(row=>{
+      const cp=String(row[cpCol]!=null?row[cpCol]:'').trim();
+      const ok=cp!==''&&cps.has(cp.toLowerCase());
+      const match=records.find(r=>r.nroCartaPorte&&r.nroCartaPorte.trim().toLowerCase()===cp.toLowerCase());
+      return{...row,_cp:cp,_ok:ok,_tienda:match?match.tienda:'—',_prov:match?match.proveedor:'—',_guia:match?match.nroGuia:'—'};
+    });
+    setRes(crossed);setView('all');
+  };
+
+  const exportXLS=()=>{
+    if(!results)return;
+    const wb=XLSX.utils.book_new();
+    const prep=arr=>arr.map(r=>{
+      const out={ESTADO:r._ok?'CON SUSTENTO':'SIN SUSTENTO','CARTA PORTE':r._cp,TIENDA:r._tienda,PROVEEDOR:r._prov,'NRO GUIA':r._guia};
+      Object.keys(r).filter(k=>!k.startsWith('_')).forEach(k=>{out[k]=r[k];});
+      return out;
+    });
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(prep(results)),'Cruce Completo');
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(prep(results.filter(r=>r._ok))),'Con Sustento');
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(prep(results.filter(r=>!r._ok))),'Sin Sustento');
+    XLSX.writeFile(wb,'Cruce_SAP_'+new Date().toISOString().slice(0,10)+'.xlsx');
+  };
+
+  const shown=results?(view==='all'?results:results.filter(r=>view==='con'?r._ok:!r._ok)):[];
+  const nCon=results?results.filter(r=>r._ok).length:0;
+  const nSin=results?results.filter(r=>!r._ok).length:0;
+
+  return(
+    <div>
+      <div style={{...cardS,marginBottom:20}}>
+        <div style={hdS}>
+          <h2 style={{margin:0,fontSize:17,fontWeight:800}}>🔄 Cruce SAP con Sustentos</h2>
+          <p style={{margin:'3px 0 0',fontSize:12,opacity:.8}}>Cargue el Excel de SAP y cruce por Nro. Carta Porte.</p>
+        </div>
+        <div style={{padding:24}}>
+          <div style={{marginBottom:16,padding:16,background:'#f8fafc',borderRadius:8,border:'1px solid #e5e7eb'}}>
+            <p style={{margin:'0 0 10px',fontWeight:800,color:BL,fontSize:13}}>1️⃣ Cargar Excel exportado de SAP</p>
+            <div style={{display:'flex',alignItems:'center',gap:12}}>
+              <button onClick={()=>ref.current&&ref.current.click()} style={{padding:'10px 20px',background:BL,color:'white',border:'none',borderRadius:8,cursor:'pointer',fontWeight:700,fontFamily:'inherit'}}>📂 Seleccionar Excel</button>
+              <input ref={ref} type="file" accept=".xlsx,.xls" onChange={loadXLS} style={{display:'none'}}/>
+              {sapRows&&<span style={{color:'#22c55e',fontWeight:700,fontSize:13}}>✅ {sapRows.length} registros cargados</span>}
+            </div>
+          </div>
+          {sapRows&&(
+            <>
+              <div style={{marginBottom:16,padding:16,background:'#f8fafc',borderRadius:8,border:'1px solid #e5e7eb'}}>
+                <p style={{margin:'0 0 10px',fontWeight:800,color:BL,fontSize:13}}>2️⃣ Columna de Carta Porte en el Excel SAP</p>
+                <select value={cpCol} onChange={e=>setCpCol(e.target.value)} style={{padding:'10px 12px',border:'1.5px solid #d1d5db',borderRadius:6,fontSize:13,minWidth:280,fontFamily:'inherit'}}>
+                  {headers.map(h=><option key={h}>{h}</option>)}
+                </select>
+              </div>
+              <div style={{padding:16,background:'#f8fafc',borderRadius:8,border:'1px solid #e5e7eb'}}>
+                <p style={{margin:'0 0 10px',fontWeight:800,color:BL,fontSize:13}}>3️⃣ Ejecutar el cruce</p>
+                <button onClick={run} style={{padding:'12px 32px',background:'linear-gradient(135deg,'+BL+','+BL2+')',color:'white',border:'none',borderRadius:8,cursor:'pointer',fontWeight:800,fontSize:15,fontFamily:'inherit'}}>▶ EJECUTAR CRUCE</button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {results&&(
+        <div style={cardS}>
+          <div style={{padding:'16px 20px',borderBottom:'1px solid #f3f4f6'}}>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12,marginBottom:16}}>
+              {[{l:'✅ Con Sustento',v:nCon,bg:'#dcfce7',fg:'#166534'},{l:'❌ Sin Sustento',v:nSin,bg:'#fee2e2',fg:'#dc2626'},{l:'📊 Total SAP',v:results.length,bg:'#dbeafe',fg:'#1e40af'}].map(s=>(
+                <div key={s.l} style={{background:s.bg,borderRadius:8,padding:14,textAlign:'center'}}>
+                  <div style={{fontSize:28,fontWeight:900,color:s.fg}}>{s.v}</div>
+                  <div style={{color:s.fg,fontWeight:700,fontSize:12}}>{s.l}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+              {[['all','Todos'],['con','Con Sustento'],['sin','Sin Sustento']].map(([k,l])=>(
+                <button key={k} onClick={()=>setView(k)} style={{padding:'7px 14px',background:view===k?BL:'white',color:view===k?'white':'#374151',border:'1.5px solid '+(view===k?BL:'#d1d5db'),borderRadius:6,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>{l}</button>
+              ))}
+              <button onClick={exportXLS} style={{marginLeft:'auto',padding:'7px 16px',background:'#166534',color:'white',border:'none',borderRadius:6,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>📥 Exportar a Excel</button>
+            </div>
+          </div>
+          <div style={{overflowX:'auto',maxHeight:380,overflowY:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',minWidth:500}}>
+              <thead style={{position:'sticky',top:0,zIndex:1}}>
+                <tr style={{background:'#f8fafc',borderBottom:'2px solid #e5e7eb'}}>
+                  {['Estado','Carta Porte (SAP)','Tienda','Proveedor','Nro. Guía'].map(h=>(
+                    <th key={h} style={{padding:'10px 12px',textAlign:'left',color:'#374151',fontWeight:800,fontSize:11,whiteSpace:'nowrap'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((r,i)=>(
+                  <tr key={i} style={{background:r._ok?'#f0fdf4':'#fff5f5',borderBottom:'1px solid #f3f4f6'}}>
+                    <td style={{padding:'9px 12px'}}><span style={{background:r._ok?'#dcfce7':'#fee2e2',color:r._ok?'#166534':'#dc2626',padding:'3px 10px',borderRadius:20,fontSize:11,fontWeight:800}}>{r._ok?'✅ CON SUSTENTO':'❌ SIN SUSTENTO'}</span></td>
+                    <td style={{padding:'9px 12px',fontFamily:'monospace',fontWeight:700,color:'#1e40af',fontSize:13}}>{r._cp||'—'}</td>
+                    <td style={{padding:'9px 12px',fontSize:13}}>{r._tienda}</td>
+                    <td style={{padding:'9px 12px',fontSize:13}}>{r._prov}</td>
+                    <td style={{padding:'9px 12px',fontFamily:'monospace',fontSize:13}}>{r._guia}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Admin ──────────────────────────────────────────────────────────────────
+function Admin({tiendas,provs,saveT,saveP,contacts,saveCont,users,pending,onApprove,onReject,notify}){
+  const [at,setAt]=useState('tiendas');
+  const [approvePw,setAPw]=useState({});
+  const ATABS=[{k:'tiendas',l:'🏪 Tiendas'},{k:'provs',l:'🏭 Proveedores'},{k:'contacts',l:'📞 Contactos'},{k:'pending',l:'📩 Solicitudes'+(pending.length>0?' ('+pending.length+')':'')},{k:'users',l:'👥 Usuarios'}];
+
+  return(
+    <div style={cardS}>
+      <div style={hdS}><h2 style={{margin:0,fontSize:17,fontWeight:800}}>⚙️ Panel de Administración</h2></div>
+      <div style={{display:'flex',borderBottom:'1px solid #e5e7eb',background:'#f8fafc',overflowX:'auto'}}>
+        {ATABS.map(t=>(
+          <button key={t.k} onClick={()=>setAt(t.k)} style={{padding:'12px 18px',border:'none',background:at===t.k?'white':'transparent',borderBottom:at===t.k?'2px solid '+BL2:'2px solid transparent',cursor:'pointer',fontSize:13,fontWeight:at===t.k?700:400,color:at===t.k?BL2:'#6b7280',fontFamily:'inherit',whiteSpace:'nowrap'}}>{t.l}</button>
+        ))}
+      </div>
+      <div style={{padding:24}}>
+        {at==='tiendas'&&<ListMgr items={tiendas} onSave={saveT} notify={notify} singular="tienda"/>}
+        {at==='provs'&&<ListMgr items={provs} onSave={saveP} notify={notify} singular="proveedor"/>}
+        {at==='contacts'&&<ContactMgr contacts={contacts} saveCont={saveCont} notify={notify}/>}
+        {at==='pending'&&(
+          <div>
+            {pending.length===0?<p style={{color:'#9ca3af',textAlign:'center',padding:'20px 0'}}>Sin solicitudes pendientes</p>:
+              pending.map(req=>(
+                <div key={req.id} style={{padding:16,border:'1px solid #e5e7eb',borderRadius:8,marginBottom:12,background:'#fafafa'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:12,flexWrap:'wrap'}}>
+                    <div>
+                      <div style={{fontWeight:700,fontSize:14}}>{req.name}</div>
+                      <div style={{fontSize:12,color:'#6b7280'}}>{req.email}</div>
+                      {req.reason&&<div style={{fontSize:12,color:'#374151',marginTop:4}}>Motivo: {req.reason}</div>}
+                      <div style={{fontSize:11,color:'#9ca3af',marginTop:2}}>Solicitado: {new Date(req.requestedAt).toLocaleDateString('es-PE')}</div>
+                    </div>
+                    <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+                      <input value={approvePw[req.id]||''} onChange={e=>setAPw(p=>({...p,[req.id]:e.target.value}))} placeholder="Contraseña a asignar" style={{padding:'7px 10px',border:'1.5px solid #d1d5db',borderRadius:6,fontSize:12,fontFamily:'inherit',minWidth:170}}/>
+                      <button onClick={()=>onApprove(req.id,approvePw[req.id])} style={{padding:'7px 14px',background:'#22c55e',color:'white',border:'none',borderRadius:6,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>✓ Aprobar</button>
+                      <button onClick={()=>onReject(req.id)} style={{padding:'7px 14px',background:'#ef4444',color:'white',border:'none',borderRadius:6,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>✕ Rechazar</button>
+                    </div>
+                  </div>
+                </div>
+              ))
+            }
+          </div>
+        )}
+        {at==='users'&&(
+          <div style={{overflowX:'auto'}}>
+            {users.length===0?<p style={{color:'#9ca3af',textAlign:'center'}}>Sin usuarios registrados</p>:
+              <table style={{width:'100%',borderCollapse:'collapse'}}>
+                <thead><tr style={{background:'#f8fafc',borderBottom:'2px solid #e5e7eb'}}>{['Nombre','Correo','Rol','Registro'].map(h=><th key={h} style={{padding:'10px 12px',textAlign:'left',fontWeight:800,fontSize:12,color:'#374151'}}>{h}</th>)}</tr></thead>
+                <tbody>{users.map((u,i)=>(
+                  <tr key={u.id} style={{borderBottom:'1px solid #f3f4f6',background:i%2===0?'white':'#fafafa'}}>
+                    <td style={{padding:'10px 12px',fontSize:13,fontWeight:600}}>{u.name}</td>
+                    <td style={{padding:'10px 12px',fontSize:13,color:'#2563eb'}}>{u.email}</td>
+                    <td style={{padding:'10px 12px'}}><span style={{background:u.role==='admin'?'#fef3c7':'#dbeafe',color:u.role==='admin'?'#92400e':'#1e40af',padding:'2px 8px',borderRadius:12,fontSize:11,fontWeight:700}}>{u.role==='admin'?'👑 Admin':'👤 Usuario'}</span></td>
+                    <td style={{padding:'10px 12px',fontSize:12,color:'#6b7280'}}>{new Date(u.createdAt).toLocaleDateString('es-PE')}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ListMgr({items,onSave,notify,singular}){
+  const [val,setVal]=useState('');
+  const [editing,setEditing]=useState(null);
+  const [editV,setEV]=useState('');
+  const is={padding:'9px 11px',border:'1.5px solid #d1d5db',borderRadius:6,fontSize:13,outline:'none',flex:1,fontFamily:'inherit',color:'#111',background:'white'};
+  const add=()=>{const v=val.trim();if(!v)return;if(items.includes(v)){notify('Ya existe ese '+singular,'warn');return;}onSave([...items,v]);setVal('');notify(singular.charAt(0).toUpperCase()+singular.slice(1)+' agregado/a');};
+  const del=name=>{onSave(items.filter(x=>x!==name));notify('Eliminado');};
+  const saveEdit=()=>{const v=editV.trim();if(!v)return;onSave(items.map(x=>x===editing?v:x));setEditing(null);notify('Actualizado');};
+  return(
+    <div>
+      <div style={{display:'flex',gap:8,marginBottom:16}}>
+        <input value={val} onChange={e=>setVal(e.target.value)} onKeyDown={e=>e.key==='Enter'&&add()} placeholder={'Nuevo '+singular+'...'} style={is}/>
+        <button onClick={add} style={{padding:'9px 16px',background:BL,color:'white',border:'none',borderRadius:6,cursor:'pointer',fontWeight:800,fontSize:17,fontFamily:'inherit'}}>＋</button>
+      </div>
+      <div style={{display:'flex',flexDirection:'column',gap:7,maxHeight:350,overflowY:'auto'}}>
+        {items.length===0&&<p style={{color:'#9ca3af',fontSize:13,textAlign:'center',padding:'20px 0'}}>Sin registros. Agrega el primero.</p>}
+        {items.map(item=>(
+          editing===item?(
+            <div key={item} style={{display:'flex',gap:7}}>
+              <input value={editV} onChange={e=>setEV(e.target.value)} onKeyDown={e=>e.key==='Enter'&&saveEdit()} style={is} autoFocus/>
+              <button onClick={saveEdit} style={{padding:'8px 12px',background:'#22c55e',color:'white',border:'none',borderRadius:6,cursor:'pointer',fontWeight:800}}>✓</button>
+              <button onClick={()=>setEditing(null)} style={{padding:'8px 12px',background:'#e5e7eb',color:'#374151',border:'none',borderRadius:6,cursor:'pointer'}}>✕</button>
+            </div>
+          ):(
+            <div key={item} style={{display:'flex',alignItems:'center',gap:8,padding:'10px 12px',background:'#f8fafc',borderRadius:7,border:'1px solid #e5e7eb'}}>
+              <span style={{flex:1,fontSize:13,color:'#374151',fontWeight:500}}>{item}</span>
+              <button onClick={()=>{setEditing(item);setEV(item);}} style={{padding:'4px 10px',background:'#dbeafe',color:'#1e40af',border:'none',borderRadius:5,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>✏️ Editar</button>
+              <button onClick={()=>del(item)} style={{padding:'4px 10px',background:'#fee2e2',color:'#dc2626',border:'none',borderRadius:5,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>🗑</button>
+            </div>
+          )
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ContactMgr({contacts,saveCont,notify}){
+  const [name,setName]=useState('');
+  const [email,setEmail]=useState('');
+  const [editing,setEditing]=useState(null);
+  const [editName,setEN]=useState('');
+  const [editEmail,setEE]=useState('');
+  const is={padding:'9px 11px',border:'1.5px solid #d1d5db',borderRadius:6,fontSize:13,outline:'none',fontFamily:'inherit',color:'#111',background:'white',flex:1};
+  const add=()=>{if(!name.trim()||!email.trim()){notify('Completa nombre y correo','warn');return;}if(contacts.length>=3){notify('Máximo 3 contactos','warn');return;}saveCont([...contacts,{id:uid(),name:name.trim(),email:email.trim()}]);setName('');setEmail('');notify('Contacto agregado');};
+  const del=id=>{saveCont(contacts.filter(c=>c.id!==id));notify('Contacto eliminado');};
+  const saveEdit=()=>{if(!editName.trim()||!editEmail.trim())return;saveCont(contacts.map(c=>c.id===editing?{...c,name:editName.trim(),email:editEmail.trim()}:c));setEditing(null);notify('Contacto actualizado');};
+  return(
+    <div>
+      <p style={{fontSize:12,color:'#6b7280',margin:'0 0 14px'}}>Máximo 3 contactos administradores. Se muestran a usuarios sin acceso corporativo.</p>
+      {contacts.length<3&&(
+        <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap'}}>
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder="Nombre del contacto" style={is}/>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="correo@sodimac.com" style={is}/>
+          <button onClick={add} style={{padding:'9px 16px',background:BL,color:'white',border:'none',borderRadius:6,cursor:'pointer',fontWeight:800,fontSize:17,fontFamily:'inherit'}}>＋</button>
+        </div>
+      )}
+      <div style={{display:'flex',flexDirection:'column',gap:8}}>
+        {contacts.length===0&&<p style={{color:'#9ca3af',fontSize:13,textAlign:'center',padding:'20px 0'}}>Sin contactos configurados.</p>}
+        {contacts.map((c,i)=>(
+          editing===c.id?(
+            <div key={c.id} style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+              <input value={editName} onChange={e=>setEN(e.target.value)} style={is}/>
+              <input type="email" value={editEmail} onChange={e=>setEE(e.target.value)} style={is}/>
+              <button onClick={saveEdit} style={{padding:'8px 12px',background:'#22c55e',color:'white',border:'none',borderRadius:6,cursor:'pointer',fontWeight:800}}>✓</button>
+              <button onClick={()=>setEditing(null)} style={{padding:'8px 12px',background:'#e5e7eb',color:'#374151',border:'none',borderRadius:6,cursor:'pointer'}}>✕</button>
+            </div>
+          ):(
+            <div key={c.id} style={{display:'flex',alignItems:'center',gap:12,padding:'12px 14px',background:'#f8fafc',borderRadius:8,border:'1px solid #e5e7eb'}}>
+              <div style={{background:'#dbeafe',color:'#1e40af',borderRadius:'50%',width:30,height:30,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:13,flexShrink:0}}>{i+1}</div>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:700,fontSize:13}}>{c.name}</div>
+                <a href={'mailto:'+c.email} style={{fontSize:12,color:'#2563eb',textDecoration:'none'}}>📧 {c.email}</a>
+              </div>
+              <button onClick={()=>{setEditing(c.id);setEN(c.name);setEE(c.email);}} style={{padding:'4px 10px',background:'#dbeafe',color:'#1e40af',border:'none',borderRadius:5,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>✏️</button>
+              <button onClick={()=>del(c.id)} style={{padding:'4px 10px',background:'#fee2e2',color:'#dc2626',border:'none',borderRadius:5,cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:'inherit'}}>🗑</button>
+            </div>
+          )
+        ))}
+      </div>
+    </div>
+  );
+}
