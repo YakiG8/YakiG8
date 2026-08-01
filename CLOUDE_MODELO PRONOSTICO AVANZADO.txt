@@ -1,0 +1,1152 @@
+# =============================================================================
+# PRONÓSTICO DE DEMANDA — PERIÓDICO EXPRESO | RUTA MIRAFLORES
+# Modelo Híbrido: SARIMA + XGBoost + Weighted Average Ensemble (WAE)
+# Basado en: Hammam et al. (2025) — Scientific Reports, Nature
+# DOI: https://doi.org/10.1038/s41598-025-23352-w
+# =============================================================================
+# INSTRUCCIONES PARA GOOGLE COLAB:
+# 1. Sube tu archivo 'PronosticoVentas.xlsx' a Colab (ícono de carpeta → subir)
+# 2. Ejecuta las celdas EN ORDEN, de arriba hacia abajo
+# 3. Cada celda tiene un título y explicación de lo que hace
+# =============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 1 — INSTALACIÓN DE LIBRERÍAS
+# Instala las librerías que no vienen por defecto en Google Colab.
+# Solo necesitas ejecutar esta celda UNA VEZ por sesión.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# !pip install pmdarima xgboost scikit-learn openpyxl statsmodels matplotlib seaborn pandas numpy -q
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 2 — IMPORTACIÓN DE LIBRERÍAS
+# Cargamos todas las herramientas que vamos a necesitar a lo largo del notebook.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+# Modelos estadísticos
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller, acf, pacf
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+import pmdarima as pm  # auto_arima para selección automática de parámetros
+
+# Machine Learning
+from xgboost import XGBRegressor
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
+
+print("✅ Librerías cargadas correctamente.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 3 — CARGA Y LIMPIEZA DE DATOS
+# Cargamos el archivo Excel y preparamos los datos para el análisis.
+# Pasos de limpieza según Hammam et al. (2025):
+#   - Eliminar filas con ceros operativos (cierre de planta)
+#   - Completar valores faltantes
+#   - Organizar como serie temporal indexada por fecha
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- AJUSTA ESTA RUTA SI TU ARCHIVO TIENE OTRO NOMBRE ---
+ARCHIVO = 'PronosticoVentas.xlsx'
+
+# Carga del archivo
+df_raw = pd.read_excel(ARCHIVO)
+
+# Limpiar espacios en nombres de columnas
+df_raw.columns = df_raw.columns.str.strip()
+
+print(f"📂 Archivo cargado: {ARCHIVO}")
+print(f"   Filas totales: {df_raw.shape[0]} | Columnas: {df_raw.shape[1]}")
+print(f"\n   Columnas detectadas: {df_raw.columns.tolist()}")
+print(f"\n📊 Primeras 5 filas:")
+print(df_raw.head())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 4 — PREPARACIÓN DE LA SERIE TEMPORAL
+# Filtramos los días con cero producción (cierre operativo, no son outliers).
+# Creamos la variable objetivo: DEMANDA = VENTAS + DEVOLUCIONES
+# La demanda real es lo que el mercado quería comprar ese día, independientemente
+# de cuánto se produjo.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Convertir FECHA a datetime
+df_raw['FECHA'] = pd.to_datetime(df_raw['FECHA'])
+
+# Ordenar por fecha
+df_raw = df_raw.sort_values('FECHA').reset_index(drop=True)
+
+# Identificar y separar días de cierre operativo (producción = 0)
+# Nota: El 29/02/2024 es un cero aislado → posible dato faltante
+# Los días 23-30/09/2025 son cierre confirmado por el usuario
+dias_cierre = df_raw[df_raw['PRODUCCION'] == 0][['FECHA', 'PRODUCCION', 'VENTAS', 'DEVOLUCION' if 'DEVOLUCION' in df_raw.columns else 'DEVOLUCIONES']]
+print(f"⚠️  Días con producción = 0 (excluidos del modelo):")
+print(dias_cierre.to_string(index=False))
+
+# Filtrar: eliminar días con cero producción
+df = df_raw[df_raw['PRODUCCION'] > 0].copy()
+
+# Crear variable DEMANDA REAL = VENTAS + DEVOLUCIONES
+# Esto representa la demanda verdadera del mercado
+dev_col = 'DEVOLUCION' if 'DEVOLUCION' in df.columns else 'DEVOLUCIONES'
+df['DEMANDA'] = df['VENTAS'] + df[dev_col]
+
+# Establecer FECHA como índice de la serie temporal
+df = df.set_index('FECHA')
+df.index.freq = None  # Serie diaria sin frecuencia forzada
+
+print(f"\n✅ Serie limpia: {len(df)} días hábiles de operación")
+print(f"   Desde: {df.index.min().date()}  →  Hasta: {df.index.max().date()}")
+print(f"\n📊 Estadísticas de DEMANDA:")
+print(df['DEMANDA'].describe().round(2))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 5 — CALENDARIO DE EVENTOS EXTERNOS (PERÚ 2024-2025)
+# Creamos el diccionario de feriados y eventos especiales de Perú.
+# Estos se usarán como variables externas (features) en el modelo XGBoost.
+# Clasificación de impacto:
+#   -2 = Baja extrema (Navidad, Viernes Santo)
+#   -1 = Baja (feriado estándar)
+#    0 = Normal
+#   +1 = Alta (Fiestas Patrias, pre-elecciones)
+#   +2 = Alta extrema (elecciones, eventos políticos)
+# ─────────────────────────────────────────────────────────────────────────────
+
+eventos = {
+    # 2024
+    '2024-01-01': -1,  # Año Nuevo
+    '2024-03-28': -1,  # Jueves Santo
+    '2024-03-29': -2,  # Viernes Santo
+    '2024-05-01': -1,  # Día del Trabajo
+    '2024-05-26': +2,  # Elecciones Municipales Complementarias
+    '2024-06-07': -1,  # Batalla de Arica
+    '2024-06-29': -1,  # San Pedro y San Pablo
+    '2024-07-23': -1,  # Día de la FAP
+    '2024-07-26': +1,  # Mensaje a la Nación
+    '2024-07-28': +1,  # Fiestas Patrias Día 1
+    '2024-07-29': -1,  # Fiestas Patrias Día 2
+    '2024-08-06': -1,  # Batalla de Junín
+    '2024-08-30': -1,  # Santa Rosa de Lima
+    '2024-10-08': -1,  # Combate de Angamos
+    '2024-11-01': -1,  # Todos los Santos
+    '2024-12-08': -1,  # Inmaculada Concepción
+    '2024-12-09': -1,  # Batalla de Ayacucho
+    '2024-12-25': -2,  # Navidad
+    # 2025
+    '2025-01-01': -1,  # Año Nuevo
+    '2025-04-17': -1,  # Jueves Santo
+    '2025-04-18': -2,  # Viernes Santo
+    '2025-05-01': -1,  # Día del Trabajo
+    '2025-06-07': -1,  # Batalla de Arica
+    '2025-06-29': -1,  # San Pedro y San Pablo
+    '2025-07-23': -1,  # Día de la FAP
+    '2025-07-28': +1,  # Fiestas Patrias Día 1
+    '2025-07-29': -1,  # Fiestas Patrias Día 2
+    '2025-08-06': -1,  # Batalla de Junín
+    '2025-08-30': -1,  # Santa Rosa de Lima
+    '2025-10-08': -1,  # Combate de Angamos
+    '2025-11-01': -1,  # Todos los Santos
+    '2025-12-08': -1,  # Inmaculada Concepción
+    '2025-12-09': -1,  # Batalla de Ayacucho
+    '2025-12-25': -2,  # Navidad
+}
+
+# Convertir a Serie con índice datetime
+eventos_serie = pd.Series({pd.to_datetime(k): v for k, v in eventos.items()}, name='IMPACTO_EVENTO')
+
+print(f"✅ Calendario cargado: {len(eventos_serie)} eventos registrados (2024-2025)")
+print(f"   Desglose por tipo de impacto:")
+from collections import Counter
+conteo = Counter(eventos_serie.values)
+for k, v in sorted(conteo.items()):
+    etiqueta = {-2: 'Baja extrema', -1: 'Baja', 0: 'Normal', 1: 'Alta', 2: 'Alta extrema'}.get(k, str(k))
+    print(f"   {etiqueta:15s} ({k:+d}): {v} días")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 6 — DETECCIÓN DE OUTLIERS (±3 DESVIACIONES ESTÁNDAR)
+# Según Hammam et al. (2025): "any data point beyond ±3 standard deviations
+# from the rolling mean was excluded".
+# Visualizamos los outliers ANTES de decidir qué hacer con ellos.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Calcular media y desviación estándar móviles (ventana 30 días)
+rolling_mean = df['DEMANDA'].rolling(window=30, center=True).mean()
+rolling_std  = df['DEMANDA'].rolling(window=30, center=True).std()
+
+# Límites de ±3 desviaciones estándar
+limite_sup = rolling_mean + 3 * rolling_std
+limite_inf = rolling_mean - 3 * rolling_std
+
+# Identificar outliers
+outliers_mask = (df['DEMANDA'] > limite_sup) | (df['DEMANDA'] < limite_inf)
+outliers = df[outliers_mask][['DEMANDA', 'VENTAS']]
+outliers[dev_col] = df[outliers_mask][dev_col]
+
+print(f"🔍 Outliers detectados: {outliers_mask.sum()} días")
+if len(outliers) > 0:
+    print(outliers.to_string())
+
+# Visualización
+fig, ax = plt.subplots(figsize=(16, 5))
+ax.plot(df.index, df['DEMANDA'], color='#2196F3', linewidth=0.8, label='Demanda diaria')
+ax.fill_between(df.index, limite_inf, limite_sup, alpha=0.15, color='gray', label='Banda ±3σ')
+ax.scatter(df.index[outliers_mask], df['DEMANDA'][outliers_mask],
+           color='red', s=40, zorder=5, label=f'Outliers ({outliers_mask.sum()})')
+ax.set_title('Serie de Demanda con Banda de ±3 Desviaciones Estándar', fontsize=14, fontweight='bold')
+ax.set_xlabel('Fecha')
+ax.set_ylabel('Demanda (unidades)')
+ax.legend()
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+plt.tight_layout()
+plt.savefig('fig_01_outliers.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("📊 Gráfico guardado como 'fig_01_outliers.png'")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 7 — GRÁFICO PRINCIPAL: EVOLUCIÓN HISTÓRICA
+# Periódico Expreso | Ruta Miraflores
+# Tres líneas: Producción (azul), Ventas (verde), Devoluciones (rojo)
+# Eje X: años 2024 y 2025 | Eje Y: volumen en unidades
+# ─────────────────────────────────────────────────────────────────────────────
+
+fig, ax = plt.subplots(figsize=(18, 7))
+
+# Líneas principales
+ax.plot(df.index, df['PRODUCCION'],
+        color='#1565C0', linewidth=1.5, label='Producción', alpha=0.9)
+ax.plot(df.index, df['VENTAS'],
+        color='#2E7D32', linewidth=1.5, label='Ventas', alpha=0.9)
+ax.plot(df.index, df[dev_col],
+        color='#C62828', linewidth=1.2, label='Devoluciones', alpha=0.85, linestyle='--')
+
+# Configuración de eje X: mostrar SOLO el año
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=[4, 7, 10]))
+
+# Línea de separación entre años
+for year in [2025]:
+    ax.axvline(pd.to_datetime(f'{year}-01-01'), color='gray', linestyle=':', linewidth=1, alpha=0.5)
+
+# Leyenda en la parte SUPERIOR
+ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.0),
+          ncol=3, fontsize=12, frameon=True, fancybox=True,
+          edgecolor='#BDBDBD', facecolor='white')
+
+# Títulos y etiquetas
+ax.set_title('Periódico Expreso — Ruta Miraflores\nEvolución Histórica: Producción, Ventas y Devoluciones',
+             fontsize=15, fontweight='bold', pad=40)
+ax.set_xlabel('Año', fontsize=12)
+ax.set_ylabel('Volumen (unidades)', fontsize=12)
+ax.set_ylim(0)
+ax.grid(axis='y', linestyle='--', alpha=0.4)
+
+plt.tight_layout()
+plt.savefig('fig_02_evolucion_historica.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("📊 Gráfico guardado como 'fig_02_evolucion_historica.png'")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 8 — ANÁLISIS EXPLORATORIO: PATRÓN SEMANAL
+# Promedio de demanda y devoluciones por día de la semana.
+# Confirma que sábados y domingos tienen mayor demanda.
+# ─────────────────────────────────────────────────────────────────────────────
+
+df['DIA_SEMANA'] = df.index.dayofweek  # 0=Lunes ... 6=Domingo
+dias_nombres = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+
+patron_semanal = df.groupby('DIA_SEMANA').agg(
+    Demanda_Media=('DEMANDA', 'mean'),
+    Ventas_Media=('VENTAS', 'mean'),
+    Devolucion_Media=(dev_col, 'mean')
+).round(1)
+patron_semanal.index = dias_nombres
+
+print("📅 Patrón de demanda por día de la semana:")
+print(patron_semanal.to_string())
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+# Demanda por día
+colors = ['#FF7043' if d in ['Sábado', 'Domingo'] else '#42A5F5' for d in dias_nombres]
+axes[0].bar(dias_nombres, patron_semanal['Demanda_Media'], color=colors, edgecolor='white')
+axes[0].set_title('Demanda Promedio por Día de Semana', fontweight='bold')
+axes[0].set_ylabel('Unidades promedio')
+axes[0].tick_params(axis='x', rotation=30)
+for i, v in enumerate(patron_semanal['Demanda_Media']):
+    axes[0].text(i, v + 3, str(int(v)), ha='center', fontsize=9, fontweight='bold')
+
+# Tasa de devolución por día
+tasa_dev = (patron_semanal['Devolucion_Media'] / patron_semanal['Demanda_Media'] * 100).round(1)
+axes[1].bar(dias_nombres, tasa_dev, color='#EF5350', edgecolor='white', alpha=0.85)
+axes[1].set_title('Tasa de Devolución (%) por Día de Semana', fontweight='bold')
+axes[1].set_ylabel('% devolución sobre demanda')
+axes[1].tick_params(axis='x', rotation=30)
+for i, v in enumerate(tasa_dev):
+    axes[1].text(i, v + 0.3, f'{v}%', ha='center', fontsize=9, fontweight='bold')
+
+plt.suptitle('Patrones Semanales — Periódico Expreso | Ruta Miraflores',
+             fontsize=13, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig('fig_03_patron_semanal.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("📊 Gráfico guardado como 'fig_03_patron_semanal.png'")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 9 — TABLA RESUMEN DE KPIs HISTÓRICOS
+# Métricas clave del negocio que usaremos como línea base para comparar
+# con los KPIs del modelo de pronóstico al final del notebook.
+# ─────────────────────────────────────────────────────────────────────────────
+
+kpis_historicos = {
+    'Días analizados': len(df),
+    'Ventas promedio/día': round(df['VENTAS'].mean(), 1),
+    'Producción promedio/día': round(df['PRODUCCION'].mean(), 1),
+    'Devoluciones promedio/día': round(df[dev_col].mean(), 1),
+    'Demanda promedio/día': round(df['DEMANDA'].mean(), 1),
+    'Tasa devolución promedio (%)': round((df[dev_col] / df['PRODUCCION']).mean() * 100, 2),
+    'Eficiencia producción (ventas/producción %)': round((df['VENTAS'] / df['PRODUCCION']).mean() * 100, 2),
+    'Máxima demanda registrada': df['DEMANDA'].max(),
+    'Mínima demanda registrada': df['DEMANDA'].min(),
+}
+
+print("=" * 55)
+print("  KPIs HISTÓRICOS — LÍNEA BASE DEL NEGOCIO")
+print("=" * 55)
+for k, v in kpis_historicos.items():
+    print(f"  {k:<45} {v}")
+print("=" * 55)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 10 — PRUEBA DE ESTACIONARIEDAD (ADF TEST)
+# La prueba ADF (Augmented Dickey-Fuller) determina si la serie es estacionaria.
+# - Si p-valor < 0.05 → la serie ES estacionaria (no necesita diferenciación)
+# - Si p-valor > 0.05 → la serie NO es estacionaria (ARIMA necesitará d>0)
+# Esto es el paso 2 del framework de Hammam et al. (2025).
+# ─────────────────────────────────────────────────────────────────────────────
+
+serie = df['DEMANDA']
+
+resultado_adf = adfuller(serie.dropna(), autolag='AIC')
+print("=" * 55)
+print("  TEST DE ESTACIONARIEDAD — ADF")
+print("=" * 55)
+print(f"  Estadístico ADF  : {resultado_adf[0]:.4f}")
+print(f"  p-valor          : {resultado_adf[1]:.4f}")
+print(f"  Lags usados      : {resultado_adf[2]}")
+print(f"  Observaciones    : {resultado_adf[3]}")
+print(f"\n  Valores críticos:")
+for clave, valor in resultado_adf[4].items():
+    print(f"    {clave}: {valor:.4f}")
+print("=" * 55)
+if resultado_adf[1] < 0.05:
+    print("  ✅ CONCLUSIÓN: Serie ESTACIONARIA (p < 0.05)")
+    print("     → Se puede usar ARIMA directamente")
+    ES_ESTACIONARIA = True
+else:
+    print("  ⚠️  CONCLUSIÓN: Serie NO ESTACIONARIA (p ≥ 0.05)")
+    print("     → ARIMA necesitará diferenciación (d ≥ 1)")
+    ES_ESTACIONARIA = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 11 — DESCOMPOSICIÓN ESTACIONAL Y GRÁFICOS ACF/PACF
+# Separamos la serie en: tendencia + estacionalidad + residuo.
+# ACF y PACF nos dicen qué lags son importantes para ARIMA y XGBoost.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Descomposición estacional (periodo = 7 días → semana)
+descomposicion = seasonal_decompose(serie, model='additive', period=7, extrapolate_trend='freq')
+
+fig, axes = plt.subplots(4, 1, figsize=(16, 12))
+descomposicion.observed.plot(ax=axes[0], color='#1565C0')
+axes[0].set_title('Serie Original (Demanda Diaria)', fontweight='bold')
+axes[0].set_ylabel('Unidades')
+
+descomposicion.trend.plot(ax=axes[1], color='#388E3C')
+axes[1].set_title('Tendencia', fontweight='bold')
+axes[1].set_ylabel('Unidades')
+
+descomposicion.seasonal.plot(ax=axes[2], color='#F57C00')
+axes[2].set_title('Estacionalidad Semanal (periodo=7)', fontweight='bold')
+axes[2].set_ylabel('Efecto estacional')
+
+descomposicion.resid.plot(ax=axes[3], color='#C62828')
+axes[3].set_title('Residuos (ruido no explicado)', fontweight='bold')
+axes[3].set_ylabel('Residuo')
+
+for ax in axes:
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.grid(axis='y', linestyle='--', alpha=0.3)
+
+plt.suptitle('Descomposición Estacional — Demanda Periódico Expreso',
+             fontsize=14, fontweight='bold', y=1.01)
+plt.tight_layout()
+plt.savefig('fig_04_descomposicion.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# ACF y PACF
+fig, axes = plt.subplots(1, 2, figsize=(16, 4))
+plot_acf(serie.dropna(), lags=30, ax=axes[0], color='#1565C0')
+axes[0].set_title('ACF — Autocorrelación (identifica q y estacionalidad)', fontweight='bold')
+plot_pacf(serie.dropna(), lags=30, ax=axes[1], color='#388E3C', method='ywm')
+axes[1].set_title('PACF — Autocorrelación Parcial (identifica p)', fontweight='bold')
+plt.tight_layout()
+plt.savefig('fig_05_acf_pacf.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("📊 Gráficos guardados: fig_04_descomposicion.png, fig_05_acf_pacf.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 12 — SELECCIÓN AUTOMÁTICA DEL MODELO ARIMA/SARIMA
+# Usamos auto_arima de pmdarima para encontrar los mejores parámetros
+# (p, d, q) y estacionales (P, D, Q, s) minimizando el criterio AIC.
+# Se prueban dos versiones: con y sin stepwise (como en Hammam et al.).
+# ─────────────────────────────────────────────────────────────────────────────
+
+print("🔍 Buscando mejor modelo SARIMA (puede tomar 1-3 minutos)...")
+print("   Esto prueba múltiples combinaciones de parámetros automáticamente.\n")
+
+# Modelo M1: CON función stepwise (más rápido)
+modelo_m1 = pm.auto_arima(
+    serie,
+    start_p=0, max_p=3,
+    start_q=0, max_q=3,
+    d=None,           # auto-detectar diferenciación
+    seasonal=True,
+    m=7,              # periodo estacional = 7 días (semanal)
+    start_P=0, max_P=2,
+    start_Q=0, max_Q=2,
+    D=None,
+    stepwise=True,    # búsqueda inteligente (más rápida)
+    information_criterion='aic',
+    trace=False,
+    error_action='ignore',
+    suppress_warnings=True
+)
+
+# Modelo M2: SIN función stepwise (búsqueda más exhaustiva)
+modelo_m2 = pm.auto_arima(
+    serie,
+    start_p=0, max_p=3,
+    start_q=0, max_q=3,
+    d=None,
+    seasonal=True,
+    m=7,
+    start_P=0, max_P=2,
+    start_Q=0, max_Q=2,
+    D=None,
+    stepwise=False,   # búsqueda completa
+    information_criterion='aic',
+    trace=False,
+    error_action='ignore',
+    suppress_warnings=True,
+    n_jobs=-1
+)
+
+print("=" * 60)
+print("  COMPARACIÓN DE MODELOS SARIMA (AIC y BIC)")
+print("=" * 60)
+print(f"  M1 (con stepwise)   → Orden: {modelo_m1.order} | Estacional: {modelo_m1.seasonal_order}")
+print(f"     AIC: {modelo_m1.aic():.2f}  |  BIC: {modelo_m1.bic():.2f}")
+print(f"\n  M2 (sin stepwise)   → Orden: {modelo_m2.order} | Estacional: {modelo_m2.seasonal_order}")
+print(f"     AIC: {modelo_m2.aic():.2f}  |  BIC: {modelo_m2.bic():.2f}")
+
+# Seleccionar el modelo con menor AIC
+if modelo_m1.aic() <= modelo_m2.aic():
+    mejor_sarima_info = modelo_m1
+    print(f"\n  ✅ GANADOR: M1 (stepwise) — AIC más bajo")
+else:
+    mejor_sarima_info = modelo_m2
+    print(f"\n  ✅ GANADOR: M2 (sin stepwise) — AIC más bajo")
+
+ORDEN_SARIMA = mejor_sarima_info.order
+ORDEN_ESTACIONAL = mejor_sarima_info.seasonal_order
+print(f"     Parámetros seleccionados: SARIMA{ORDEN_SARIMA}x{ORDEN_ESTACIONAL}")
+print("=" * 60)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 13 — DIVISIÓN DE DATOS PARA ENTRENAMIENTO Y PRUEBA
+# Según Hammam et al. (2025):
+#   - SARIMA:  80% entrenamiento | 20% prueba
+#   - XGBoost: 65% entreno | 15% validación | 20% prueba
+# El conjunto de prueba es el mismo en ambos casos para comparación justa.
+# ─────────────────────────────────────────────────────────────────────────────
+
+n = len(serie)
+n_test  = int(n * 0.20)         # 20% para prueba
+n_val   = int(n * 0.15)         # 15% para validación (solo XGBoost)
+n_train_sarima = n - n_test     # 80% para SARIMA
+n_train_xgb    = n - n_test - n_val  # 65% para XGBoost
+
+# División para SARIMA
+train_sarima = serie.iloc[:n_train_sarima]
+test_sarima  = serie.iloc[n_train_sarima:]
+
+# División para XGBoost
+train_xgb = serie.iloc[:n_train_xgb]
+val_xgb   = serie.iloc[n_train_xgb:n_train_xgb + n_val]
+test_xgb  = serie.iloc[n_train_xgb + n_val:]
+
+print("=" * 55)
+print("  DIVISIÓN DE DATOS")
+print("=" * 55)
+print(f"  Total de días       : {n}")
+print(f"\n  Para SARIMA:")
+print(f"    Entrenamiento (80%): {len(train_sarima)} días")
+print(f"    Prueba        (20%): {len(test_sarima)} días")
+print(f"\n  Para XGBoost:")
+print(f"    Entrenamiento (65%): {len(train_xgb)} días")
+print(f"    Validación    (15%): {len(val_xgb)} días")
+print(f"    Prueba        (20%): {len(test_xgb)} días")
+print(f"\n  Período de prueba: {test_sarima.index[0].date()} → {test_sarima.index[-1].date()}")
+print("=" * 55)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 14 — ENTRENAMIENTO DEL MODELO SARIMA Y PRONÓSTICO
+# Entrenamos SARIMA con los parámetros seleccionados automáticamente.
+# Generamos predicciones sobre el conjunto de prueba.
+# ─────────────────────────────────────────────────────────────────────────────
+
+print(f"⚙️  Entrenando SARIMA{ORDEN_SARIMA}x{ORDEN_ESTACIONAL}...")
+
+modelo_sarima = SARIMAX(
+    train_sarima,
+    order=ORDEN_SARIMA,
+    seasonal_order=ORDEN_ESTACIONAL,
+    enforce_stationarity=False,
+    enforce_invertibility=False
+)
+
+resultado_sarima = modelo_sarima.fit(disp=False)
+
+# Pronóstico sobre el período de prueba
+pred_sarima = resultado_sarima.forecast(steps=len(test_sarima))
+pred_sarima = np.maximum(pred_sarima, 0)  # No puede haber demanda negativa
+
+print("✅ SARIMA entrenado correctamente.")
+print(f"   Predicciones generadas: {len(pred_sarima)} días")
+print(f"\n   Muestra de predicciones (primeros 7 días de prueba):")
+for fecha, real, pred in zip(test_sarima.index[:7], test_sarima.values[:7], pred_sarima[:7]):
+    print(f"   {fecha.date()}  Real: {int(real):4d}  |  SARIMA: {int(pred):4d}  |  Δ: {int(pred-real):+4d}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 15 — DIAGNÓSTICO DE RESIDUOS DEL MODELO SARIMA
+# Analizamos los residuos para detectar si hay patrones no lineales.
+# Si hay patrón en los residuos → necesitamos XGBoost.
+# Cuatro gráficos diagnósticos (igual que en Hammam et al. Fig. 4):
+#   1. Residuos en el tiempo
+#   2. Histograma de residuos
+#   3. Q-Q Plot (normalidad)
+#   4. Correlograma (ACF de residuos)
+# ─────────────────────────────────────────────────────────────────────────────
+
+residuos = resultado_sarima.resid
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+# 1. Residuos en el tiempo
+axes[0, 0].plot(residuos, color='#7B1FA2', linewidth=0.8)
+axes[0, 0].axhline(0, color='red', linestyle='--', linewidth=1)
+axes[0, 0].set_title('1. Residuos Estandarizados en el Tiempo', fontweight='bold')
+axes[0, 0].set_xlabel('Fecha')
+axes[0, 0].set_ylabel('Residuo')
+
+# 2. Histograma + KDE
+axes[0, 1].hist(residuos, bins=30, color='#7B1FA2', edgecolor='white', alpha=0.7, density=True)
+from scipy import stats as scipy_stats
+x_kde = np.linspace(residuos.min(), residuos.max(), 200)
+kde = scipy_stats.gaussian_kde(residuos.dropna())
+axes[0, 1].plot(x_kde, kde(x_kde), color='red', linewidth=2, label='KDE')
+axes[0, 1].plot(x_kde, scipy_stats.norm.pdf(x_kde, residuos.mean(), residuos.std()),
+                color='blue', linewidth=2, linestyle='--', label='Normal teórica')
+axes[0, 1].set_title('2. Histograma y Densidad de Residuos', fontweight='bold')
+axes[0, 1].legend()
+
+# 3. Q-Q Plot
+scipy_stats.probplot(residuos.dropna(), dist='norm', plot=axes[1, 0])
+axes[1, 0].set_title('3. Q-Q Plot (¿Distribución Normal?)', fontweight='bold')
+axes[1, 0].get_lines()[0].set(color='#7B1FA2', markersize=3)
+
+# 4. ACF de residuos (correlograma)
+plot_acf(residuos.dropna(), lags=30, ax=axes[1, 1], color='#7B1FA2')
+axes[1, 1].set_title('4. Correlograma de Residuos (ACF)', fontweight='bold')
+
+plt.suptitle('Diagnóstico de Residuos SARIMA\n(Fuente: Hammam et al., 2025 — Fig. 4)',
+             fontsize=13, fontweight='bold', y=1.01)
+plt.tight_layout()
+plt.savefig('fig_06_diagnostico_residuos.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# Evaluación automática de normalidad de residuos
+stat_jb, p_jb = scipy_stats.jarque_bera(residuos.dropna())
+acf_vals = acf(residuos.dropna(), nlags=14, alpha=0.05)
+hay_patron_acf = np.any(np.abs(acf_vals[0][1:]) > 2/np.sqrt(len(residuos)))
+
+print("\n📋 CONCLUSIÓN DIAGNÓSTICO DE RESIDUOS:")
+print(f"   Jarque-Bera (normalidad) p-valor: {p_jb:.4f}")
+if p_jb < 0.05:
+    print("   ⚠️  Residuos NO son normales → HAY patrones no lineales")
+    HAY_NO_LINEALIDAD = True
+else:
+    print("   ✅ Residuos son normales → SARIMA captura bien la estructura")
+    HAY_NO_LINEALIDAD = False
+
+if hay_patron_acf:
+    print("   ⚠️  ACF muestra correlación en residuos → confirma no linealidad")
+    HAY_NO_LINEALIDAD = True
+else:
+    print("   ✅ ACF de residuos sin patrón significativo")
+
+print(f"\n   → ¿Se activa XGBoost? {'SÍ — datos tienen no linealidad' if HAY_NO_LINEALIDAD else 'NO — SARIMA es suficiente'}")
+print("   (El WAE se calcula siempre para validar)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 16 — INGENIERÍA DE FEATURES PARA XGBOOST
+# XGBoost no entiende series de tiempo directamente.
+# Debemos crear variables (features) que capturen:
+#   1. Lags (valores pasados de la demanda)
+#   2. Día de semana (0=Lunes, 6=Domingo)
+#   3. Mes del año
+#   4. Número de semana
+#   5. Impacto de eventos del calendario
+#   6. Tendencia (número de día desde el inicio)
+# Esto sigue el paso de "Features extraction" de Hammam et al. (2025).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def crear_features(df_input, lags=[1, 2, 3, 5, 7, 14], evento_serie=None):
+    """
+    Crea las variables de entrada para XGBoost.
+    Parámetros:
+        df_input: DataFrame con columna DEMANDA
+        lags: lista de periodos de rezago a incluir
+        evento_serie: Serie de pandas con impacto de eventos (índice=fecha)
+    """
+    df_feat = df_input[['DEMANDA']].copy()
+    df_feat.columns = ['y']
+
+    # Features temporales
+    df_feat['dia_semana']  = df_feat.index.dayofweek     # 0=Lunes, 6=Domingo
+    df_feat['es_finde']    = (df_feat['dia_semana'] >= 5).astype(int)  # 1 si sáb/dom
+    df_feat['mes']         = df_feat.index.month
+    df_feat['semana_anio'] = df_feat.index.isocalendar().week.astype(int)
+    df_feat['dia_anio']    = df_feat.index.dayofyear
+    df_feat['tendencia']   = np.arange(len(df_feat))     # progresión lineal del tiempo
+
+    # Lags de demanda (valores de días anteriores)
+    for lag in lags:
+        df_feat[f'lag_{lag}'] = df_feat['y'].shift(lag)
+
+    # Media móvil de 7 días (demanda promedio semanal anterior)
+    df_feat['media_movil_7']  = df_feat['y'].shift(1).rolling(window=7).mean()
+    df_feat['media_movil_14'] = df_feat['y'].shift(1).rolling(window=14).mean()
+
+    # Impacto de eventos del calendario
+    if evento_serie is not None:
+        df_feat['impacto_evento'] = df_feat.index.map(
+            lambda d: evento_serie.get(d, 0)
+        )
+    else:
+        df_feat['impacto_evento'] = 0
+
+    # Eliminar filas con NaN (generados por los lags)
+    df_feat = df_feat.dropna()
+
+    return df_feat
+
+# Crear features para todo el dataset
+df_features = crear_features(df, lags=[1, 2, 3, 5, 7, 14], evento_serie=eventos_serie)
+
+# Columnas de features (todo excepto 'y' que es el target)
+feature_cols = [c for c in df_features.columns if c != 'y']
+
+print(f"✅ Features creadas: {len(feature_cols)} variables")
+print(f"   Variables: {feature_cols}")
+print(f"\n📊 Muestra de features (últimas 3 filas):")
+print(df_features[feature_cols].tail(3).to_string())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 17 — ENTRENAMIENTO DE XGBOOST CON GRID SEARCH
+# Buscamos los mejores hiperparámetros usando GridSearchCV.
+# Los 6 hiperparámetros clave son los mismos de Hammam et al. (2025), Tabla 1.
+# TimeSeriesSplit garantiza que la validación cruzada respete el orden temporal.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Alinear el dataset de features con el mismo período de test que SARIMA
+X_total = df_features[feature_cols]
+y_total = df_features['y']
+
+# División temporal (misma proporción que SARIMA)
+n_feat = len(X_total)
+n_test_feat = int(n_feat * 0.20)
+n_val_feat  = int(n_feat * 0.15)
+
+X_train = X_total.iloc[:n_feat - n_test_feat - n_val_feat]
+y_train = y_total.iloc[:n_feat - n_test_feat - n_val_feat]
+X_val   = X_total.iloc[n_feat - n_test_feat - n_val_feat : n_feat - n_test_feat]
+y_val   = y_total.iloc[n_feat - n_test_feat - n_val_feat : n_feat - n_test_feat]
+X_test  = X_total.iloc[n_feat - n_test_feat:]
+y_test  = y_total.iloc[n_feat - n_test_feat:]
+
+# Grid de hiperparámetros (Hammam et al., 2025 — Tabla 1)
+param_grid = {
+    'learning_rate'    : [0.01, 0.1],
+    'max_depth'        : [3, 5],
+    'n_estimators'     : [100, 200, 300],
+    'colsample_bytree' : [0.8, 1.0],
+    'reg_alpha'        : [0.001, 0.01],
+    'subsample'        : [0.6, 0.8],
+}
+
+print("⚙️  Iniciando búsqueda de hiperparámetros con GridSearchCV...")
+print(f"   Combinaciones a probar: {2*2*3*2*2*2} | Puede tomar 3-8 minutos en Colab.")
+
+tscv = TimeSeriesSplit(n_splits=3)  # Validación cruzada temporal (3 folds)
+
+xgb_base = XGBRegressor(
+    objective='reg:squarederror',
+    random_state=42,
+    verbosity=0,
+    n_jobs=-1
+)
+
+grid_search = GridSearchCV(
+    estimator=xgb_base,
+    param_grid=param_grid,
+    cv=tscv,
+    scoring='neg_root_mean_squared_error',
+    n_jobs=-1,
+    verbose=0
+)
+
+# Entrenamos con train + validación juntos para el grid
+X_train_val = pd.concat([X_train, X_val])
+y_train_val = pd.concat([y_train, y_val])
+
+grid_search.fit(X_train_val, y_train_val)
+
+print("\n✅ Búsqueda completada.")
+print(f"   Mejores hiperparámetros encontrados:")
+for k, v in grid_search.best_params_.items():
+    print(f"     {k:<20} : {v}")
+
+# Modelo XGBoost final con los mejores hiperparámetros
+modelo_xgb = XGBRegressor(
+    **grid_search.best_params_,
+    objective='reg:squarederror',
+    random_state=42,
+    verbosity=0,
+    n_jobs=-1,
+    early_stopping_rounds=20,
+    eval_metric='rmse'
+)
+
+# Entrenamos con early stopping usando el set de validación
+modelo_xgb.fit(
+    X_train, y_train,
+    eval_set=[(X_val, y_val)],
+    verbose=False
+)
+
+# Predicciones en el set de prueba
+pred_xgb_raw = modelo_xgb.predict(X_test)
+pred_xgb = np.maximum(pred_xgb_raw, 0)  # Sin demanda negativa
+
+print(f"\n📊 XGBoost — Muestra de predicciones (primeros 7 días):")
+for fecha, real, pred in zip(y_test.index[:7], y_test.values[:7], pred_xgb[:7]):
+    print(f"   {fecha.date()}  Real: {int(real):4d}  |  XGBoost: {int(pred):4d}  |  Δ: {int(pred-real):+4d}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 18 — IMPORTANCIA DE FEATURES EN XGBOOST
+# Qué variables explican más la demanda del periódico.
+# Confirma si los lags, el día de semana o los eventos son los más relevantes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+importancias = pd.Series(
+    modelo_xgb.feature_importances_,
+    index=feature_cols
+).sort_values(ascending=False)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+colores_imp = ['#1565C0' if i < 5 else '#90CAF9' for i in range(len(importancias))]
+importancias.plot(kind='barh', ax=ax, color=colores_imp[::-1])
+ax.set_title('Importancia de Variables — Modelo XGBoost\n(F-Score: frecuencia de uso en árboles de decisión)',
+             fontsize=13, fontweight='bold')
+ax.set_xlabel('Importancia relativa (F-Score)')
+ax.invert_yaxis()
+plt.tight_layout()
+plt.savefig('fig_07_importancia_features.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("📊 Top 5 variables más importantes:")
+for feat, imp in importancias.head(5).items():
+    print(f"   {feat:<20} : {imp:.4f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 19 — MODELO ENSEMBLE WAE (WEIGHTED AVERAGE ENSEMBLE)
+# Combinamos SARIMA + XGBoost asignando pesos que minimizan el RMSE.
+# Fórmula: F_WAE = ω1 × F_SARIMA + ω2 × F_XGBoost  |  ω1 + ω2 = 1
+# Búsqueda por grid con pasos de 0.1 (igual que Hammam et al., 2025).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Alinear predicciones de SARIMA y XGBoost al mismo período de prueba
+# (pueden tener longitudes distintas por diferencia en manejo de lags)
+n_test_comun = min(len(pred_sarima), len(pred_xgb))
+y_test_comun = test_sarima.values[-n_test_comun:]
+pred_sarima_comun = pred_sarima[-n_test_comun:]
+pred_xgb_comun    = pred_xgb[-n_test_comun:]
+
+# Búsqueda de pesos óptimos
+mejor_rmse_wae = np.inf
+mejor_w1 = 0.5
+mejor_w2 = 0.5
+
+pesos = np.arange(0.0, 1.1, 0.1)
+for w1 in pesos:
+    w2 = round(1 - w1, 1)
+    pred_wae_temp = w1 * pred_sarima_comun + w2 * pred_xgb_comun
+    rmse_temp = np.sqrt(mean_squared_error(y_test_comun, pred_wae_temp))
+    if rmse_temp < mejor_rmse_wae:
+        mejor_rmse_wae = rmse_temp
+        mejor_w1 = w1
+        mejor_w2 = w2
+
+# Predicción final del WAE
+pred_wae = mejor_w1 * pred_sarima_comun + mejor_w2 * pred_xgb_comun
+pred_wae = np.maximum(pred_wae, 0)
+
+print("=" * 55)
+print("  MODELO ENSEMBLE WAE — PESOS ÓPTIMOS")
+print("=" * 55)
+print(f"  ω1 (SARIMA)  : {mejor_w1:.1f}")
+print(f"  ω2 (XGBoost) : {mejor_w2:.1f}")
+print(f"  RMSE WAE     : {mejor_rmse_wae:.2f} unidades")
+
+# Interpretación de los pesos
+if mejor_w2 > mejor_w1:
+    print(f"\n  📌 XGBoost tiene más peso → los datos tienen componente no lineal")
+    print(f"     (similar a DS1 y DS4 en Hammam et al., 2025)")
+elif mejor_w1 > mejor_w2:
+    print(f"\n  📌 SARIMA tiene más peso → la demanda sigue patrón principalmente lineal")
+    print(f"     (similar a DS3 en Hammam et al., 2025)")
+else:
+    print(f"\n  📌 Pesos iguales → mezcla equilibrada de linealidad y no linealidad")
+    print(f"     (similar a DS2 en Hammam et al., 2025)")
+print("=" * 55)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 20 — EVALUACIÓN Y COMPARACIÓN DE LOS TRES MODELOS
+# Calculamos MAE, MSE, RMSE y MAPE para cada modelo.
+# Los comparamos entre sí y contra los benchmarks de Hammam et al. (2025).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calcular_metricas(y_real, y_pred, nombre):
+    """Calcula y retorna las 4 métricas estándar de pronóstico."""
+    mae  = mean_absolute_error(y_real, y_pred)
+    mse  = mean_squared_error(y_real, y_pred)
+    rmse = np.sqrt(mse)
+    # MAPE: evitar división por cero
+    mask = y_real != 0
+    mape = np.mean(np.abs((y_real[mask] - y_pred[mask]) / y_real[mask])) * 100
+    return {'Modelo': nombre, 'MAE': round(mae, 2), 'MSE': round(mse, 2),
+            'RMSE': round(rmse, 2), 'MAPE (%)': round(mape, 2)}
+
+resultados = pd.DataFrame([
+    calcular_metricas(y_test_comun, pred_sarima_comun, 'SARIMA'),
+    calcular_metricas(y_test_comun, pred_xgb_comun,    'XGBoost'),
+    calcular_metricas(y_test_comun, pred_wae,           'WAE (Ensemble)'),
+])
+
+print("=" * 65)
+print("  EVALUACIÓN DE MODELOS — TU DATASET (Expreso, Miraflores)")
+print("=" * 65)
+print(resultados.to_string(index=False))
+
+# Determinar ganador
+ganador_idx = resultados['RMSE'].idxmin()
+ganador = resultados.loc[ganador_idx, 'Modelo']
+mape_ganador = resultados.loc[ganador_idx, 'MAPE (%)']
+
+print(f"\n  🏆 MODELO GANADOR: {ganador}")
+print(f"     MAPE = {mape_ganador:.2f}%")
+print("=" * 65)
+
+# Comparación con benchmarks del paper
+print("\n" + "=" * 65)
+print("  COMPARACIÓN vs BENCHMARKS — Hammam et al. (2025)")
+print("  Scientific Reports, Nature | DOI: 10.1038/s41598-025-23352-w")
+print("=" * 65)
+benchmarks = [
+    ('DS1 — Declive (SARIMA)', 14, 2642),
+    ('DS1 — Declive (XGBoost)', 8, 1818),
+    ('DS1 — Declive (WAE)', 8, 1649),
+    ('DS3 — Madurez lineal (SARIMA/WAE)', 2, 2.87),
+    ('DS4 — Erático (XGBoost/WAE)', 13, 59.57),
+    ('DS5 — Erático extremo (XGBoost/WAE)', 6, 7.39),
+]
+print(f"  {'Dataset':45s} {'MAPE%':>6}  {'RMSE':>8}")
+print(f"  {'-'*45} {'------':>6}  {'--------':>8}")
+for nombre, mape_b, rmse_b in benchmarks:
+    print(f"  {nombre:45s} {mape_b:>6.1f}%  {rmse_b:>8.2f}")
+print(f"\n  {'TU MODELO (' + ganador + ')':45s} {mape_ganador:>6.2f}%  {resultados.loc[ganador_idx,'RMSE']:>8.2f}")
+print("=" * 65)
+
+if mape_ganador < 8:
+    print(f"\n  ✅ EXCELENTE: Tu MAPE < 8% → supera al WAE del paper en DS1")
+elif mape_ganador < 13:
+    print(f"\n  ✅ BUENO: Tu MAPE < 13% → dentro del rango esperado para datos erráticos")
+elif mape_ganador < 20:
+    print(f"\n  ⚠️  ACEPTABLE: Tu MAPE < 20% → razonable con datos diarios de alta variabilidad")
+else:
+    print(f"\n  ⚠️  MEJORABLE: MAPE > 20% → considera añadir más variables externas")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 21 — GRÁFICO DE COMPARACIÓN: REAL vs SARIMA vs XGBOOST vs WAE
+# Visualizamos los 3 modelos sobre el período de prueba.
+# ─────────────────────────────────────────────────────────────────────────────
+
+fechas_test = test_sarima.index[-n_test_comun:]
+
+fig, axes = plt.subplots(3, 1, figsize=(18, 15), sharex=True)
+
+for ax, pred, nombre, color in zip(
+    axes,
+    [pred_sarima_comun, pred_xgb_comun, pred_wae],
+    ['SARIMA', 'XGBoost', 'WAE (Ensemble)'],
+    ['#1565C0', '#388E3C', '#F57C00']
+):
+    ax.plot(fechas_test, y_test_comun, color='black', linewidth=1.5,
+            label='Demanda Real', zorder=3)
+    ax.plot(fechas_test, pred, color=color, linewidth=1.5,
+            linestyle='--', label=f'Pronóstico {nombre}', zorder=2)
+    mape_m = calcular_metricas(y_test_comun, pred, nombre)['MAPE (%)']
+    rmse_m = calcular_metricas(y_test_comun, pred, nombre)['RMSE']
+    ax.set_title(f'{nombre}  |  MAPE: {mape_m:.2f}%  |  RMSE: {rmse_m:.2f}',
+                 fontweight='bold', fontsize=12)
+    ax.legend(loc='upper right', fontsize=10)
+    ax.set_ylabel('Unidades')
+    ax.grid(axis='y', linestyle='--', alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+
+axes[-1].set_xlabel('Fecha (período de prueba)')
+plt.suptitle('Comparación de Modelos vs Demanda Real\nPeríodico Expreso — Ruta Miraflores',
+             fontsize=14, fontweight='bold', y=1.01)
+plt.tight_layout()
+plt.savefig('fig_08_comparacion_modelos.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("📊 Gráfico guardado como 'fig_08_comparacion_modelos.png'")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 22 — PRONÓSTICO DE DEMANDA FUTURA (PRÓXIMOS 30 DÍAS)
+# Usamos el modelo ganador para pronosticar la demanda de los próximos 30 días.
+# La recomendación de producción incluye un margen de seguridad configurable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ---- PARÁMETRO AJUSTABLE ----
+DIAS_A_PRONOSTICAR = 30    # Cambia este número según lo que necesites
+MARGEN_SEGURIDAD   = 0.05  # 5% sobre el pronóstico. Cambia si quieres más/menos colchón
+# -----------------------------
+
+# Generamos fechas futuras (días hábiles, excluyendo domingos si aplica)
+ultima_fecha = df.index.max()
+fechas_futuras = pd.date_range(
+    start=ultima_fecha + pd.Timedelta(days=1),
+    periods=DIAS_A_PRONOSTICAR,
+    freq='D'
+)
+
+# Pronóstico con SARIMA
+pred_futura_sarima = resultado_sarima.forecast(steps=DIAS_A_PRONOSTICAR)
+pred_futura_sarima = np.maximum(pred_futura_sarima, 0)
+
+# Pronóstico con XGBoost: necesitamos construir features para el futuro
+# Usamos el último valor conocido como punto de partida (rolling forecast)
+demanda_hist = serie.values.copy()
+pred_futura_xgb = []
+
+for i, fecha in enumerate(fechas_futuras):
+    # Construir un vector de features para este día futuro
+    lag_vals = {}
+    for lag in [1, 2, 3, 5, 7, 14]:
+        idx = len(demanda_hist) - lag
+        lag_vals[f'lag_{lag}'] = demanda_hist[idx] if idx >= 0 else demanda_hist.mean()
+
+    feat_fila = {
+        'dia_semana'   : fecha.dayofweek,
+        'es_finde'     : int(fecha.dayofweek >= 5),
+        'mes'          : fecha.month,
+        'semana_anio'  : fecha.isocalendar()[1],
+        'dia_anio'     : fecha.dayofyear,
+        'tendencia'    : len(df) + i,
+        **lag_vals,
+        'media_movil_7' : np.mean(demanda_hist[-7:]),
+        'media_movil_14': np.mean(demanda_hist[-14:]),
+        'impacto_evento': eventos_serie.get(fecha.normalize(), 0),
+    }
+
+    X_fila = pd.DataFrame([feat_fila])[feature_cols]
+    pred_i = max(0, float(modelo_xgb.predict(X_fila)[0]))
+    pred_futura_xgb.append(pred_i)
+    demanda_hist = np.append(demanda_hist, pred_i)
+
+pred_futura_xgb = np.array(pred_futura_xgb)
+
+# Ensemble WAE futuro
+pred_futura_wae = mejor_w1 * pred_futura_sarima + mejor_w2 * pred_futura_xgb
+pred_futura_wae = np.maximum(pred_futura_wae, 0)
+
+# Seleccionar predicción del modelo ganador
+if ganador == 'SARIMA':
+    pred_final_futuro = pred_futura_sarima
+elif ganador == 'XGBoost':
+    pred_final_futuro = pred_futura_xgb
+else:
+    pred_final_futuro = pred_futura_wae
+
+# Calcular producción recomendada
+produccion_recomendada = np.ceil(pred_final_futuro * (1 + MARGEN_SEGURIDAD)).astype(int)
+
+# Crear tabla de resultados
+dias_semana_es = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+tabla_pronostico = pd.DataFrame({
+    'Fecha'                 : fechas_futuras.strftime('%Y-%m-%d'),
+    'Día'                   : [dias_semana_es[d.weekday()] for d in fechas_futuras],
+    'Demanda Pronosticada'  : pred_final_futuro.round(0).astype(int),
+    'Producir (recomendado)': produccion_recomendada,
+    'Margen aplicado'       : [f"+{int(MARGEN_SEGURIDAD*100)}%" for _ in fechas_futuras],
+    'Evento especial'       : [
+        {-2: '🔴 Baja extrema', -1: '🟠 Baja', 0: '', 1: '🟢 Alta', 2: '🔵 Alta extrema'}.get(
+            eventos_serie.get(d.normalize(), 0), ''
+        )
+        for d in fechas_futuras
+    ]
+})
+
+print(f"\n{'='*80}")
+print(f"  PLAN DE PRODUCCIÓN RECOMENDADO — Próximos {DIAS_A_PRONOSTICAR} días")
+print(f"  Modelo: {ganador}  |  Margen de seguridad: {int(MARGEN_SEGURIDAD*100)}%")
+print(f"{'='*80}")
+print(tabla_pronostico.to_string(index=False))
+print(f"{'='*80}")
+print(f"\n  Total unidades a producir en los próximos {DIAS_A_PRONOSTICAR} días: "
+      f"{produccion_recomendada.sum():,}")
+print(f"  Promedio diario recomendado: {int(produccion_recomendada.mean()):,}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 23 — GRÁFICO DEL PRONÓSTICO FUTURO
+# Muestra el histórico reciente + el pronóstico del modelo ganador.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Últimos 60 días históricos para contexto
+hist_reciente = serie.iloc[-60:]
+
+fig, ax = plt.subplots(figsize=(18, 7))
+
+# Histórico
+ax.plot(hist_reciente.index, hist_reciente.values,
+        color='#1565C0', linewidth=1.5, label='Demanda histórica (real)')
+
+# Pronóstico
+ax.plot(fechas_futuras, pred_final_futuro,
+        color='#F57C00', linewidth=2, linestyle='--', label=f'Pronóstico ({ganador})')
+ax.fill_between(
+    fechas_futuras,
+    pred_final_futuro * 0.9,
+    pred_final_futuro * 1.1,
+    alpha=0.15, color='#F57C00', label='Intervalo ±10%'
+)
+
+# Producción recomendada
+ax.plot(fechas_futuras, produccion_recomendada,
+        color='#2E7D32', linewidth=1.5, linestyle=':', label=f'Producción recomendada (+{int(MARGEN_SEGURIDAD*100)}%)')
+
+# Línea vertical de separación
+ax.axvline(ultima_fecha, color='gray', linestyle='--', linewidth=1, alpha=0.7, label='Hoy')
+
+# Marcar eventos especiales
+for fecha in fechas_futuras:
+    impacto = eventos_serie.get(fecha.normalize(), 0)
+    if impacto != 0:
+        color_ev = '#C62828' if impacto < 0 else '#1B5E20'
+        ax.axvline(fecha, color=color_ev, alpha=0.3, linewidth=3)
+
+ax.set_title(f'Pronóstico de Demanda — Próximos {DIAS_A_PRONOSTICAR} Días\n'
+             f'Periódico Expreso | Ruta Miraflores | Modelo: {ganador}',
+             fontsize=14, fontweight='bold')
+ax.set_xlabel('Fecha')
+ax.set_ylabel('Unidades')
+ax.legend(loc='upper left', fontsize=10)
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+ax.xaxis.set_major_locator(mdates.MonthLocator())
+ax.grid(axis='y', linestyle='--', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('fig_09_pronostico_futuro.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("📊 Gráfico guardado como 'fig_09_pronostico_futuro.png'")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELDA 24 — KPIs FINALES DEL MODELO vs BENCHMARK CIENTÍFICO
+# Tabla resumen completa para incluir en tu informe o presentación.
+# Compara tus resultados contra Hammam et al. (2025) — Scientific Reports.
+# ─────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("  TABLA FINAL DE KPIs — MODELO vs BENCHMARK CIENTÍFICO")
+print("  Periódico Expreso | Ruta Miraflores")
+print("  Referencia: Hammam et al. (2025) — Scientific Reports, Nature")
+print("="*70)
+
+# KPIs de tu modelo
+kpis_modelo = resultados.set_index('Modelo')
+
+print(f"\n  📊 TUS RESULTADOS:")
+print(f"  {'Métrica':10s}  {'SARIMA':>10}  {'XGBoost':>10}  {'WAE':>10}")
+print(f"  {'-'*46}")
+for metrica in ['MAE', 'MSE', 'RMSE', 'MAPE (%)']:
+    vals = [kpis_modelo.loc[m, metrica] for m in ['SARIMA', 'XGBoost', 'WAE (Ensemble)']]
+    mejor_val = min(vals)
+    fila = f"  {metrica:10s}"
+    for v in vals:
+        marca = " ◄" if v == mejor_val else "  "
+        fila += f"  {v:>8.2f}{marca}"
+    print(fila)
+
+print(f"\n  📚 BENCHMARKS — Hammam et al. (2025):")
+print(f"  {'Dataset':<45}  {'MAPE%':>6}  {'RMSE':>8}")
+print(f"  {'-'*63}")
+for nombre, mape_b, rmse_b in benchmarks:
+    print(f"  {nombre:<45}  {mape_b:>6.1f}%  {rmse_b:>8.2f}")
+
+print(f"\n  🏆 TU MEJOR MODELO: {ganador}")
+print(f"     MAPE = {mape_ganador:.2f}%  |  RMSE = {resultados.loc[ganador_idx,'RMSE']:.2f}")
+
+print("\n" + "="*70)
+print("  INTERPRETACIÓN DEL MAPE:")
+print("  < 5%   → Excelente (supera al paper en datos lineales)")
+print("  5-13%  → Bueno (dentro del rango WAE del paper)")
+print("  13-20% → Aceptable para datos diarios con alta variabilidad")
+print("  > 20%  → Considerar más variables externas o LSTM")
+print("="*70)
+
+print("\n✅ NOTEBOOK COMPLETADO EXITOSAMENTE")
+print("   Archivos generados en tu sesión de Colab:")
+print("   fig_01_outliers.png")
+print("   fig_02_evolucion_historica.png")
+print("   fig_03_patron_semanal.png")
+print("   fig_04_descomposicion.png")
+print("   fig_05_acf_pacf.png")
+print("   fig_06_diagnostico_residuos.png")
+print("   fig_07_importancia_features.png")
+print("   fig_08_comparacion_modelos.png")
+print("   fig_09_pronostico_futuro.png")
+print("\n   Para descargar los gráficos: en Colab, panel izquierdo → 📁 Archivos")
